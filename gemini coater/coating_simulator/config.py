@@ -40,43 +40,40 @@ DEFAULT_TARGET_PARAMS = {
 }
 
 DEFAULT_SOURCE_PARAMS = {
-    "src_x": 400.0,
+    "src_x": 0.0, # Изменено на 0 для симметричного старта линейного движения по умолчанию
     "src_y": 0.0,
     "src_z": 900.0,
     "rot_x": 0.0,
     "rot_y": 0.0,
-    "src_diameter": 100.0, # For ring and circular
-    "cone_angle": 60.0,   # For ring (angle phi)
-    "focus_point": "∞",   # For ring (calculated)
-    "src_length": 100.0,  # For linear
-    "src_angle": 0.0,     # For linear
+    "src_diameter": 100.0,
+    "cone_angle": 60.0,
+    "focus_point": "∞",
+    "src_length": 100.0,
+    "src_angle": 0.0,
 }
 
 DEFAULT_EMISSION_PARAMS = {
-    # 'max_theta' теперь внутренний параметр (половинный угол)
-    "max_theta": 30.0, # Половинный угол по умолчанию
-    # Значение по умолчанию для ПОЛНОГО угла в GUI будет 2 * max_theta
-    "particles": 10000,
-    "sigma": 1.0,  # For Gaussian
-    "m_exp": 1.0,  # For Cosine-power
+    "max_theta": 30.0, 
+    "particles": 10000, # Будет преобразовано в 1 x 10^4 в GUI
+    "sigma": 1.0,
+    "m_exp": 1.0,
 }
 
-# --- !!! ВОССТАНОВЛЕН СЛОВАРЬ DEFAULT_PROCESSING_PARAMS !!! ---
 DEFAULT_PROCESSING_PARAMS = {
-    "rpm": 10.0,        # For disk, dome
-    "rpm_disk": 10.0,   # For planetary (planet self-rotation)
-    "rpm_orbit": 1.0,   # For planetary (orbit rotation)
-    "speed": 1.0,       # For linear (mm/s)
-    "time": 2.0,        # Common duration (s)
+    "rpm": 10.0,
+    "rpm_disk": 10.0,
+    "rpm_orbit": 1.0,
+    "speed": 100.0, # Увеличена скорость по умолчанию для линейного
+    "time": 2.0,
+    "mini_batch_size": 64, # <--- НОВЫЙ ПАРАМЕТР: Размер мини-пачки для пересчета трансформаций
 }
-# -----------------------------------------------------------
 
 # --- Simulation Parameters ---
 SIM_GRID_SIZE = 200
-SIM_TRACE_STEPS = 500
-SIM_TRACE_MAX_DIST = 2000.0
-SIM_INTERSECTION_TOLERANCE = 5.0
-SIM_PROGRESS_INTERVAL_PERCENT = 5
+# SIM_TRACE_STEPS = 500 # Больше не используется с аналитическим методом
+# SIM_TRACE_MAX_DIST = 2000.0 # Больше не используется с аналитическим методом
+SIM_INTERSECTION_TOLERANCE = 1e-3 # Уменьшена для большей точности с аналитикой
+SIM_PROGRESS_INTERVAL_PERCENT = 5 # Для _run_simulation_loop (старый), в MP обновляется чаще
 
 # --- Visualization Parameters ---
 VIS_PROFILE_BINS = 100
@@ -87,10 +84,9 @@ VIS_DEFAULT_SHOW3D = False
 # --- Special Values ---
 INFINITY_SYMBOL = "∞"
 
-# --- Helper Functions ---
+# --- Helper Functions (без изменений) ---
 def calculate_focus_point(diameter, cone_angle_deg):
-    """Calculates focus point L based on diameter D and cone angle phi."""
-    if cone_angle_deg <= 0: return INFINITY_SYMBOL # Changed condition slightly
+    if cone_angle_deg <= 0: return INFINITY_SYMBOL
     try:
         phi_rad = math.radians(cone_angle_deg)
         tan_half_phi = math.tan(phi_rad / 2.0)
@@ -100,20 +96,16 @@ def calculate_focus_point(diameter, cone_angle_deg):
     except (ValueError, ZeroDivisionError): return INFINITY_SYMBOL
 
 def calculate_cone_angle(diameter, focus_point_L):
-    """Calculates cone angle phi based on diameter D and focus point L."""
     try:
         L_float = float(focus_point_L)
-        if L_float <= 1e-9: return "N/A" # Avoid division by zero or near-zero focus
-        if diameter <= 0: return "N/A" # Need positive diameter
-        # Ensure argument for atan is valid
+        if L_float <= 1e-9: return "N/A"
+        if diameter <= 0: return "N/A"
         atan_arg = (diameter / 2.0) / L_float
-        if abs(atan_arg) > 1e9: return "N/A" # Avoid huge arguments if L is tiny
-        
+        if abs(atan_arg) > 1e9: return "N/A"
         phi_rad = 2 * math.atan(atan_arg)
         return f"{math.degrees(phi_rad):.2f}"
     except ValueError:
          if focus_point_L == INFINITY_SYMBOL: return "0.00"
          return "N/A"
-    except ZeroDivisionError: # Should be caught by L_float check
+    except ZeroDivisionError:
          return "N/A"
-

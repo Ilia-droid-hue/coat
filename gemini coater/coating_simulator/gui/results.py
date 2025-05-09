@@ -3,7 +3,7 @@
 """
 Toplevel window for displaying simulation results with interactive uniformity controls,
 and a section for inverse problem solving (reconstructing map from profiles).
-Layout v12.11 - Ensuring map plot fills its area without colorbar using direct axes positioning.
+Layout v12.12 - Applying tight_layout to map_fig and enabling colorbar.
 """
 
 import tkinter as tk
@@ -11,7 +11,7 @@ from tkinter import ttk, messagebox, filedialog
 import numpy as np
 import traceback
 import math
-import os 
+import os
 
 try:
     from ..visualization.plot import (plot_simulation_results as plot_on_figure,
@@ -33,13 +33,14 @@ try:
     from .results_panels import SettingsPanel, PlotDisplayArea, InfoDisplayArea
 except ImportError as e_panel:
     print(f"CRITICAL: Не удалось импортировать панели из .results_panels: {e_panel}")
+    # Dummy classes for SettingsPanel, PlotDisplayArea, InfoDisplayArea if import fails
     class SettingsPanel(ttk.Frame): #type: ignore
-        def __init__(self, master, recalculate_callback, export_excel_callback, 
-                     calculate_mask_callback, load_profiles_callback, reconstruct_map_callback, 
+        def __init__(self, master, recalculate_callback, export_excel_callback,
+                     calculate_mask_callback, load_profiles_callback, reconstruct_map_callback,
                      *args, **kwargs):
             super().__init__(master, *args, **kwargs)
             ttk.Label(self, text="SettingsPanel (ЗАГЛУШКА)").pack(fill=tk.BOTH, expand=True)
-            self.recalculate_callback = recalculate_callback 
+            self.recalculate_callback = recalculate_callback
             self.export_excel_callback = export_excel_callback
             self.calculate_mask_callback = calculate_mask_callback
             self.load_profiles_callback = load_profiles_callback
@@ -61,7 +62,8 @@ except ImportError as e_panel:
         def __init__(self, master, plot_size_pixels=360, *args, **kwargs):
             super().__init__(master, *args, **kwargs)
             ttk.Label(self, text="PlotDisplayArea (ЗАГЛУШКА)").pack(fill=tk.BOTH, expand=True)
-            self.map_figure = Figure() 
+            from matplotlib.figure import Figure # Local import for dummy
+            self.map_figure = Figure()
             self.profile_figure = Figure()
         def get_map_figure(self): return self.map_figure
         def get_profile_figure(self): return self.profile_figure
@@ -75,79 +77,78 @@ except ImportError as e_panel:
         def update_auto_uniformity_info(self, text): pass
         def update_inverse_problem_info(self, text): pass
 
-import matplotlib.pyplot as plt 
-from matplotlib.figure import Figure 
+
+import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 
 class ResultsWindow(tk.Toplevel):
     """
     Окно для отображения результатов симуляции и анализа равномерности.
-    Layout v12.11 - Ensuring map plot fills its area.
+    Layout v12.12 - Applying tight_layout to map_fig and enabling colorbar.
     """
     def __init__(self, parent, coverage_map: np.ndarray, x_coords: np.ndarray, y_coords: np.ndarray, radius_grid: np.ndarray,
                  target_params: dict, vis_params: dict):
         super().__init__(parent)
         self.title("Результаты: Анализ, Сглаживание и Обратная Задача")
-        self.geometry("1100x680") 
-        self.minsize(850, 620)    
+        self.geometry("1100x680")
+        self.minsize(850, 620)
 
         self.simulation_coverage_map_raw = coverage_map
         self.simulation_x_coords = x_coords
         self.simulation_y_coords = y_coords
         self.simulation_radius_grid = radius_grid
         self.simulation_target_params = target_params
-        self.current_vis_params = vis_params.copy() 
+        self.current_vis_params = vis_params.copy()
 
-        self.loaded_profiles_data = [] 
+        self.loaded_profiles_data = []
         self.current_target_type = self.simulation_target_params.get('target_type', config.TARGET_DISK)
 
-        self.columnconfigure(0, weight=0, minsize=270) 
-        self.columnconfigure(1, weight=1)             
-        self.rowconfigure(0, weight=1)                
+        self.columnconfigure(0, weight=0, minsize=270)
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
 
         self.settings_panel = SettingsPanel(
-            self, 
+            self,
             recalculate_callback=self._placeholder_recalculate_and_redraw,
             export_excel_callback=self._placeholder_export_excel,
             calculate_mask_callback=self._placeholder_calculate_mask,
-            load_profiles_callback=self._placeholder_load_profiles,  
-            reconstruct_map_callback=self._placeholder_reconstruct_map 
+            load_profiles_callback=self._placeholder_load_profiles,
+            reconstruct_map_callback=self._placeholder_reconstruct_map
         )
         self.settings_panel.grid(row=0, column=0, sticky=tk.NSEW, padx=(10,5), pady=(10,5))
-            
-        self.update_idletasks() 
-        try: 
+
+        self.update_idletasks()
+        try:
             s_temp = ttk.Style()
             left_panel_bg_color = s_temp.lookup("TFrame", "background")
         except tk.TclError:
-            left_panel_bg_color = "SystemButtonFace" 
-        
-        if not isinstance(left_panel_bg_color, str) or not left_panel_bg_color : 
-            left_panel_bg_color = self.cget("background")
+            left_panel_bg_color = "SystemButtonFace"
 
-        print(f"DEBUG: Determined left_panel_bg_color for info area: {left_panel_bg_color}")
+        if not isinstance(left_panel_bg_color, str) or not left_panel_bg_color :
+            left_panel_bg_color = self.cget("background")
 
         style = ttk.Style()
         style.configure("InfoArea.TFrame", background=left_panel_bg_color)
-        
-        right_content_frame = ttk.Frame(self) 
-        right_content_frame.grid(row=0, column=1, sticky=tk.NSEW, padx=(5,10), pady=(10,5)) 
-        right_content_frame.columnconfigure(0, weight=1) 
-        right_content_frame.rowconfigure(0, weight=0)    
-        right_content_frame.rowconfigure(1, weight=0)    
+
+        right_content_frame = ttk.Frame(self)
+        right_content_frame.grid(row=0, column=1, sticky=tk.NSEW, padx=(5,10), pady=(10,5))
+        right_content_frame.columnconfigure(0, weight=1)
+        right_content_frame.rowconfigure(0, weight=0) # Changed from 1 to 0 for PlotDisplayArea
+        right_content_frame.rowconfigure(1, weight=0) # Changed from 1 to 0 for InfoDisplayArea
 
         self.plot_display_area = PlotDisplayArea(right_content_frame, plot_size_pixels=350)
-        self.plot_display_area.grid(row=0, column=0, sticky=tk.EW) 
+        self.plot_display_area.grid(row=0, column=0, sticky=tk.EW)
 
         self.info_display_area = InfoDisplayArea(right_content_frame, background_color=left_panel_bg_color)
-        self.info_display_area.grid(row=1, column=0, sticky=tk.EW + tk.S, pady=(5,0)) 
+        self.info_display_area.grid(row=1, column=0, sticky=tk.EW + tk.S, pady=(5,0))
 
-        if hasattr(self.settings_panel, '_initial_ui_update'): 
-            self.settings_panel._initial_ui_update() 
+        if hasattr(self.settings_panel, '_initial_ui_update'):
+            self.settings_panel._initial_ui_update()
         if PLOT_MODULE_AVAILABLE:
-            self.after(200, self._placeholder_recalculate_and_redraw) 
+            self.after(200, self._placeholder_recalculate_and_redraw)
         else:
             messagebox.showerror("Ошибка импорта", "Не удалось загрузить модуль визуализации (plot.py).\nГрафики не будут отображены.", parent=self)
-            if hasattr(self.info_display_area, 'update_uniformity_results'): 
+            if hasattr(self.info_display_area, 'update_uniformity_results'):
                 self.info_display_area.update_uniformity_results("Ошибка импорта plot.py")
 
     def _placeholder_recalculate_and_redraw(self):
@@ -157,14 +158,14 @@ class ResultsWindow(tk.Toplevel):
             return
 
         view_settings = self.settings_panel.get_view_settings()
-        if view_settings is None: 
+        if view_settings is None:
             if hasattr(self.info_display_area, 'update_uniformity_results'):
                 self.info_display_area.update_uniformity_results("Ошибка в параметрах вида/сглаживания")
             return
-            
+
         self.current_vis_params['percent'] = view_settings['display_percent']
         self.current_vis_params['logscale'] = view_settings['use_logscale']
-        
+
         smoothing_method = view_settings['smoothing']['method']
         smoothing_params_dict = view_settings['smoothing']['params']
 
@@ -177,7 +178,7 @@ class ResultsWindow(tk.Toplevel):
         if active_coverage_map is None:
             messagebox.showwarning("Нет данных", "Данные симуляции отсутствуют для отображения.", parent=self)
             return
-        
+
         raw_profile_coords_1d = None
         raw_profile_values_1d = None
         profile_axis_label = "Позиция (мм)"
@@ -214,7 +215,7 @@ class ResultsWindow(tk.Toplevel):
         if self.current_vis_params['percent']:
             max_val_for_norm = np.nanmax(active_coverage_map.astype(float))
             if max_val_for_norm <=0: max_val_for_norm = 1.0
-            
+
             profile_data_for_stats = profile_data_for_stats / max_val_for_norm * 100.0
             profile_data_for_plot = profile_data_for_plot / max_val_for_norm * 100.0
 
@@ -222,13 +223,13 @@ class ResultsWindow(tk.Toplevel):
             raw_profile_coords_1d, profile_data_for_stats,
             smoothing_method, smoothing_params_dict
         )
-        
+
         stats_source_data = smoothed_profile_for_stats
         if view_settings['show_raw_profile'] or smoothing_method == "Без сглаживания":
             stats_source_data = profile_data_for_stats
 
         stats = calculate_uniformity_stats(stats_source_data)
-        
+
         self.settings_panel.update_profile_stats(
             f"{np.nanmax(stats_source_data):.2f}" if np.any(np.isfinite(stats_source_data)) else "-",
             f"{np.nanmin(stats_source_data):.2f}" if np.any(np.isfinite(stats_source_data)) else "-",
@@ -248,35 +249,29 @@ class ResultsWindow(tk.Toplevel):
 
         map_fig.clear()
         profile_fig.clear()
-        
+
+        # Отрисовка карты
         plot_on_figure(
-            fig=map_fig, coverage_map=active_coverage_map,
+            fig=map_fig,  # Используем выделенную map_fig
+            coverage_map=active_coverage_map,
             x_coords=active_x_coords, y_coords=active_y_coords, radius_grid=active_radius_grid,
             target_params=active_target_params, vis_params=self.current_vis_params,
-            profile_1d_coords=raw_profile_coords_1d, 
-            profile_1d_values=profile_data_for_plot,
-            show_colorbar=False 
+            # profile_1d_coords и profile_1d_values не нужны для plot_type="map_only"
+            show_colorbar=True, # <<< ИЗМЕНЕНО на True
+            plot_type="map_only" # <<< ДОБАВЛЕНО для отрисовки только карты
         )
-        if len(map_fig.axes) > 1: 
-            map_fig.delaxes(map_fig.axes[1]) 
-        if len(map_fig.axes) > 0:
-             ax_map = map_fig.axes[0]
-             ax_map.set_title('Карта покрытия', fontsize=10)
-             # Устанавливаем позицию осей карты, чтобы они занимали почти всю фигуру
-             # [left, bottom, width, height] в долях от размера фигуры
-             ax_map.set_position([0.01, 0.01, 0.98, 0.92]) # Оставляем немного места сверху для заголовка
-             # Восстанавливаем соотношение сторон, если оно было 'equal'
-             if 'equal' in str(ax_map.get_aspect()).lower(): # Проверяем, было ли установлено 'equal'
-                 ax_map.set_aspect('equal', adjustable='box') 
-             else:
-                 ax_map.set_aspect('auto')
+        # Удалены строки: if len(map_fig.axes) > 1: map_fig.delaxes(map_fig.axes[1])
+        # и ax_map.set_position(...)
+        # Заголовок и соотношение сторон теперь обрабатываются внутри plot_on_figure для "map_only"
 
+        map_fig.tight_layout(pad=1.0) # <<< ДОБАВЛЕНО для автоматической компоновки
 
+        # Отрисовка профиля (на отдельной фигуре)
         ax_profile_actual = profile_fig.add_subplot(111)
-        
+
         profile_to_display_on_plot = profile_data_for_plot
         if not view_settings['show_raw_profile'] and smoothing_method != "Без сглаживания":
-            profile_to_display_on_plot = smooth_profile_data(raw_profile_coords_1d, profile_data_for_plot, 
+            profile_to_display_on_plot = smooth_profile_data(raw_profile_coords_1d, profile_data_for_plot,
                                                              smoothing_method, smoothing_params_dict)
 
         ax_profile_actual.plot(raw_profile_coords_1d, profile_to_display_on_plot, '-', color='orange', linewidth=1.5, label='Профиль')
@@ -286,14 +281,14 @@ class ResultsWindow(tk.Toplevel):
             if not np.allclose(profile_data_for_plot, smoothed_for_comparison, equal_nan=True):
                 ax_profile_actual.plot(raw_profile_coords_1d, smoothed_for_comparison, '--', color='blue', linewidth=1.0, label='Сглаженный')
         elif not view_settings['show_raw_profile'] and smoothing_method != "Без сглаживания":
-             if not np.allclose(profile_data_for_plot, profile_to_display_on_plot, equal_nan=True): 
+             if not np.allclose(profile_data_for_plot, profile_to_display_on_plot, equal_nan=True):
                 ax_profile_actual.plot(raw_profile_coords_1d, profile_data_for_plot, ':', color='gray', linewidth=1.0, label='Сырой')
 
         ax_profile_actual.set_title('Профиль покрытия', fontsize=10)
         ax_profile_actual.set_xlabel(profile_axis_label, fontsize=9)
         ax_profile_actual.set_ylabel('Покрытие (%)' if self.current_vis_params['percent'] else 'Количество частиц', fontsize=9)
         ax_profile_actual.grid(True, linestyle=':')
-        if ax_profile_actual.has_data(): 
+        if ax_profile_actual.has_data():
             ax_profile_actual.legend(fontsize='small')
 
         if np.any(np.isfinite(profile_to_display_on_plot)):
@@ -310,11 +305,10 @@ class ResultsWindow(tk.Toplevel):
         else:
             ax_profile_actual.set_ylim(0, 1 if not self.current_vis_params['percent'] else 10)
 
-        # tight_layout для map_fig больше не нужен, так как мы используем set_position
-        profile_fig.tight_layout(pad=0.8) 
+        profile_fig.tight_layout(pad=0.8) # Это уже было здесь
 
         self.plot_display_area.draw_canvases()
-        
+
         self.settings_panel.enable_export_button() if active_coverage_map is not None else self.settings_panel.disable_export_button()
         print("Обновление графиков завершено.")
 
@@ -333,7 +327,7 @@ class ResultsWindow(tk.Toplevel):
             filetypes=[("CSV файлы", "*.csv"), ("Текстовые файлы", "*.txt"), ("Все файлы", "*.*")]
         )
         if filepaths:
-            self.loaded_profiles_data = [] 
+            self.loaded_profiles_data = []
             filenames = [os.path.basename(fp) for fp in filepaths]
             self.settings_panel.update_loaded_files_text("Загружено: " + ", ".join(filenames) if filenames else "Файлы не загружены")
             self.info_display_area.update_inverse_problem_info(f"Загружено файлов: {len(filepaths)}.\nГотово к реконструкции.")
@@ -342,12 +336,12 @@ class ResultsWindow(tk.Toplevel):
             self.settings_panel.update_loaded_files_text("Загрузка отменена")
             self.info_display_area.update_inverse_problem_info("Файлы профилей не загружены.")
 
-    def _placeholder_reconstruct_map(self, reconstruction_method: str): 
-        if not self.settings_panel.loaded_files_text_var.get().startswith("Загружено:"): 
+    def _placeholder_reconstruct_map(self, reconstruction_method: str):
+        if not self.settings_panel.loaded_files_text_var.get().startswith("Загружено:"):
             messagebox.showwarning("Обратная задача", "Сначала загрузите файлы профилей.", parent=self)
             self.info_display_area.update_inverse_problem_info("Ошибка: Профили не загружены.")
             return
-        
+
         self.info_display_area.update_inverse_problem_info(f"Реконструкция ({reconstruction_method})...\n(Функция не реализована)")
         messagebox.showinfo("Заглушка", f"Функция построения карты по профилям ({reconstruction_method}) еще не реализована.", parent=self)
 
@@ -355,7 +349,7 @@ class ResultsWindow(tk.Toplevel):
 # --- Example Usage ---
 if __name__ == '__main__':
     root = tk.Tk()
-    root.title("Тест ResultsWindow GUI v12.11") 
+    root.title("Тест ResultsWindow GUI v12.12")
     root.geometry("200x100")
 
     grid_res = 50
@@ -371,13 +365,13 @@ if __name__ == '__main__':
     mock_vis_params = {'percent': True, 'logscale': False}
 
     def open_results():
-        print("Открытие окна результатов (GUI v12.11)...")
+        print("Открытие окна результатов (GUI v12.12)...")
         try:
             ResultsWindow(root, mock_coverage, mock_x, mock_y, mock_rr, mock_target_params, mock_vis_params)
         except Exception as e:
             print(f"Ошибка при открытии ResultsWindow: {e}")
             traceback.print_exc()
 
-    button = ttk.Button(root, text="Показать окно (GUI v12.11)", command=open_results)
+    button = ttk.Button(root, text="Показать окно (GUI v12.12)", command=open_results)
     button.pack(pady=20)
     root.mainloop()

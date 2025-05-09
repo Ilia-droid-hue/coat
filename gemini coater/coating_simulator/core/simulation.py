@@ -2,499 +2,514 @@
 """
 Core simulation functions for different target types using Monte Carlo method.
 Основные функции симуляции для различных типов мишеней методом Монте-Карло.
+Optimized with analytical ray-target intersection and multiprocessing.
+Worker further optimized with vectorized particle processing.
+Grid setup for linear target now correctly uses length for X and width for Y.
+Linear target movement path updated for symmetry around the source's X-position,
+with overruns based on the source's X-offset from GUI.
+Movement resolution within worker sub-chunks improved by using mini-batches,
+with mini-batch size configurable from GUI.
+Ensure mini_batch_size is passed for all simulation types.
+Corrected grid cell definition and indexing for coverage map.
 """
 
 import numpy as np
 import math
-import time # Для отладки времени выполнения
+import time
+import os
+import multiprocessing
 
-# Используем относительные импорты
-from .distribution import rotation_matrix, sample_source_position, sample_emission_vector
-from .. import config # Импортируем константы
+# Используем относительные импорты из текущего пакета .core
+from .distribution import rotation_matrix, sample_source_position_vectorized, sample_emission_vector_vectorized
+from .. import config
 
-def _check_intersection_disk(point: np.ndarray, radius: float) -> bool:
-    """Checks if a point intersects with a flat disk target."""
-    px, py, pz = point
-    # Check if within radius and close to Z=0 plane
-    # Проверяем, находится ли точка в пределах радиуса и близко к плоскости Z=0
-    return np.hypot(px, py) <= radius and abs(pz) < config.SIM_INTERSECTION_TOLERANCE
+# --- Вспомогательные функции для аналитического пересечения (без изменений) ---
+def _intersect_ray_plane_analytical(ray_origin: np.ndarray, ray_direction: np.ndarray,
+                                   plane_point: np.ndarray = np.array([0,0,0]),
+                                   plane_normal: np.ndarray = np.array([0,0,1])) -> tuple[np.ndarray | None, float | None]:
+    ray_origin = np.asarray(ray_origin, dtype=float)
+    ray_direction = np.asarray(ray_direction, dtype=float)
+    plane_point = np.asarray(plane_point, dtype=float)
+    plane_normal = np.asarray(plane_normal, dtype=float)
+    is_single_ray = ray_origin.ndim == 1
+    if is_single_ray:
+        ray_origin = ray_origin[:, np.newaxis]
+        ray_direction = ray_direction[:, np.newaxis]
+    ndotu = np.einsum('i,ij->j', plane_normal, ray_direction)
+    w = ray_origin - plane_point[:, np.newaxis]
+    dot_product_normal_w = np.einsum('i,ij->j', plane_normal, w)
+    t_intersect_values = np.full_like(ndotu, np.nan)
+    valid_ndotu_mask = np.abs(ndotu) >= 1e-9
+    if np.any(valid_ndotu_mask):
+      t_intersect_values[valid_ndotu_mask] = -dot_product_normal_w[valid_ndotu_mask] / ndotu[valid_ndotu_mask]
+    valid_t_mask = t_intersect_values >= -1e-7
+    intersection_points_3d = np.full_like(ray_origin, np.nan)
+    if np.any(valid_t_mask):
+        valid_indices = np.where(valid_t_mask)[0]
+        intersection_points_3d[:, valid_indices] = ray_origin[:, valid_indices] + \
+            ray_direction[:, valid_indices] * t_intersect_values[valid_indices][np.newaxis, :]
+    if is_single_ray:
+        return (intersection_points_3d[:,0] if valid_t_mask[0] else None,
+                t_intersect_values[0] if valid_t_mask[0] else None)
+    else:
+        return intersection_points_3d, t_intersect_values
 
-def _check_intersection_dome(point: np.ndarray, diameter: float, dome_radius: float) -> bool:
-    """Checks if a point intersects with a dome target."""
-    px, py, pz = point
-    radius = diameter / 2.0
-    r_sq = px**2 + py**2
+def _check_intersection_disk_analytical(ray_origin_tf: np.ndarray, ray_direction_tf: np.ndarray,
+                                       target_params: dict) -> np.ndarray | None:
+    intersection_points_3d, t_values = _intersect_ray_plane_analytical(ray_origin_tf, ray_direction_tf)
+    if intersection_points_3d is None : return None
+    is_single_ray = intersection_points_3d.ndim == 1
+    if is_single_ray:
+        if np.any(np.isnan(intersection_points_3d)): return None
+        px, py, _ = intersection_points_3d
+        radius = target_params['diameter'] / 2.0
+        return intersection_points_3d if np.hypot(px, py) <= radius + config.SIM_INTERSECTION_TOLERANCE else None
+    else:
+        px = intersection_points_3d[0,:]; py = intersection_points_3d[1,:]
+        radius = target_params['diameter'] / 2.0
+        valid_mask = ~np.isnan(px) & (np.hypot(px, py) <= radius + config.SIM_INTERSECTION_TOLERANCE)
+        output_points = np.full_like(intersection_points_3d, np.nan)
+        output_points[:, valid_mask] = intersection_points_3d[:, valid_mask]
+        return output_points
 
-    if r_sq > radius**2: # Outside the base diameter
-        return False
+def _check_intersection_dome_analytical(ray_origin_tf: np.ndarray, ray_direction_tf: np.ndarray,
+                                      target_params: dict) -> np.ndarray | None:
+    is_single_ray = ray_origin_tf.ndim == 1
+    if not is_single_ray:
+        num_rays = ray_origin_tf.shape[1]
+        results = np.full((3, num_rays), np.nan)
+        for i in range(num_rays):
+            if np.all(np.isnan(ray_origin_tf[:, i])) or np.all(np.isnan(ray_direction_tf[:, i])): continue
+            res_single = _check_intersection_dome_analytical(ray_origin_tf[:,i], ray_direction_tf[:,i], target_params)
+            if res_single is not None: results[:,i] = res_single
+        return results
+    R_dome = target_params['dome_radius']; base_diameter = target_params['diameter']
+    base_radius = base_diameter / 2.0
+    if R_dome <= 1e-6:
+        return _check_intersection_disk_analytical(ray_origin_tf, ray_direction_tf, {'diameter': base_diameter}) if base_diameter > 1e-6 else None
+    O = np.asarray(ray_origin_tf, dtype=float); D = np.asarray(ray_direction_tf, dtype=float)
+    C = np.array([0, 0, -R_dome])
+    a = np.dot(D, D); OC = O - C; b = 2 * np.dot(D, OC); c_sphere = np.dot(OC, OC) - R_dome**2
+    discriminant = b**2 - 4*a*c_sphere
+    if discriminant < -1e-9: return None
+    if discriminant < 0: discriminant = 0
+    sqrt_discriminant = math.sqrt(discriminant)
+    t_values = []
+    if abs(a) > 1e-9:
+        t1 = (-b - sqrt_discriminant) / (2*a); t2 = (-b + sqrt_discriminant) / (2*a)
+        if t1 >= -1e-7: t_values.append(t1)
+        if t2 >= -1e-7 and not np.isclose(t1,t2): t_values.append(t2)
+    if not t_values: return None
+    t_values.sort()
+    for t_val in t_values:
+        p_intersect = O + t_val * D
+        if p_intersect[2] + R_dome < -config.SIM_INTERSECTION_TOLERANCE: continue
+        if np.hypot(p_intersect[0], p_intersect[1]) <= base_radius + config.SIM_INTERSECTION_TOLERANCE:
+            return p_intersect
+    return None
 
-    # Calculate expected Z on the dome surface (center at 0,0,-dome_radius)
-    # Вычисляем ожидаемый Z на поверхности купола (центр в 0,0,-dome_radius)
-    # Equation: x^2 + y^2 + (z + dome_radius)^2 = dome_radius^2
-    # z = sqrt(dome_radius^2 - x^2 - y^2) - dome_radius
-    # We only consider the upper surface, so z should be negative or zero.
-    # Мы рассматриваем только верхнюю поверхность, поэтому z должен быть отрицательным или нулевым.
-    if dome_radius**2 < r_sq: # Avoid sqrt domain error if r > dome_radius (should be caught by radius check)
-         return False
-    z_expected = math.sqrt(dome_radius**2 - r_sq) - dome_radius
+def _check_intersection_linear_analytical(ray_origin_tf: np.ndarray, ray_direction_tf: np.ndarray,
+                                         target_params: dict) -> np.ndarray | None:
+    intersection_points_3d, t_values = _intersect_ray_plane_analytical(ray_origin_tf, ray_direction_tf)
+    if intersection_points_3d is None: return None
+    is_single_ray = intersection_points_3d.ndim == 1
+    if is_single_ray:
+        if np.any(np.isnan(intersection_points_3d)): return None
+        px, py, _ = intersection_points_3d
+        half_length = target_params['length'] / 2.0; half_width = target_params['width'] / 2.0
+        return intersection_points_3d if (
+            -half_length - config.SIM_INTERSECTION_TOLERANCE <= px <= half_length + config.SIM_INTERSECTION_TOLERANCE and
+            -half_width - config.SIM_INTERSECTION_TOLERANCE <= py <= half_width + config.SIM_INTERSECTION_TOLERANCE
+        ) else None
+    else:
+        px = intersection_points_3d[0,:]; py = intersection_points_3d[1,:]
+        half_length = target_params['length'] / 2.0; half_width = target_params['width'] / 2.0
+        valid_mask = (~np.isnan(px) &
+                      (px >= -half_length - config.SIM_INTERSECTION_TOLERANCE) &
+                      (px <= half_length + config.SIM_INTERSECTION_TOLERANCE) &
+                      (py >= -half_width - config.SIM_INTERSECTION_TOLERANCE) &
+                      (py <= half_width + config.SIM_INTERSECTION_TOLERANCE))
+        output_points = np.full_like(intersection_points_3d, np.nan)
+        output_points[:, valid_mask] = intersection_points_3d[:, valid_mask]
+        return output_points
 
-    # Check if the point's Z is close to the expected Z on the dome
-    # Проверяем, близок ли Z точки к ожидаемому Z на куполе
-    return abs(pz - z_expected) < config.SIM_INTERSECTION_TOLERANCE
+def _check_intersection_planetary_disk_analytical(ray_origin_tf: np.ndarray, ray_direction_tf: np.ndarray,
+                                                 target_params: dict) -> np.ndarray | None:
+    intersection_points_3d, t_values = _intersect_ray_plane_analytical(ray_origin_tf, ray_direction_tf)
+    if intersection_points_3d is None: return None
+    is_single_ray = intersection_points_3d.ndim == 1
+    if is_single_ray:
+        if np.any(np.isnan(intersection_points_3d)): return None
+        px, py, _ = intersection_points_3d
+        disk_radius = target_params['planet_diameter'] / 2.0
+        return intersection_points_3d if np.hypot(px, py) <= disk_radius + config.SIM_INTERSECTION_TOLERANCE else None
+    else:
+        px = intersection_points_3d[0,:]; py = intersection_points_3d[1,:]
+        disk_radius = target_params['planet_diameter'] / 2.0
+        valid_mask = ~np.isnan(px) & (np.hypot(px, py) <= disk_radius + config.SIM_INTERSECTION_TOLERANCE)
+        output_points = np.full_like(intersection_points_3d, np.nan)
+        output_points[:, valid_mask] = intersection_points_3d[:, valid_mask]
+        return output_points
 
-def _check_intersection_linear(point: np.ndarray, length: float, width: float) -> bool:
-    """Checks if a point intersects with a flat linear target."""
-    px, py, pz = point
-    half_length = length / 2.0
-    half_width = width / 2.0
-    # Check if within bounds and close to Z=0 plane
-    # Проверяем, находится ли точка в границах и близко к плоскости Z=0
-    return (abs(pz) < config.SIM_INTERSECTION_TOLERANCE and
-            -half_length <= px <= half_length and
-            -half_width <= py <= half_width)
+def _calculate_transforms_disk_dome(t: float, p: dict):
+    omega = 2 * math.pi * p['rpm'] / 60.0; target_angle = omega * t
+    target_rot_inv = rotation_matrix([0, 0, 1], -target_angle)
+    src_base = np.array([p['src_x'], p['src_y'], p['src_z']])
+    rot_x_rad = math.radians(p['rot_x']); rot_y_rad = math.radians(p['rot_y'])
+    mat_rot_y = rotation_matrix([0, 1, 0], rot_y_rad); mat_rot_x = rotation_matrix([1, 0, 0], rot_x_rad)
+    source_rot = mat_rot_x @ mat_rot_y
+    return src_base, source_rot, target_rot_inv
 
-def _check_intersection_planetary_disk(point: np.ndarray, disk_radius: float) -> bool:
-    """Checks if a point intersects with a planetary disk (assumed flat at Z=0 in its own frame)."""
-    # In the planetary simulation, the point 'p' is already transformed relative to the disk center.
-    # В симуляции планетарного движения точка 'p' уже преобразована относительно центра диска.
-    px, py, pz = point
-    # Check if within radius and close to Z=0 plane relative to the disk center
-    # Проверяем, находится ли точка в пределах радиуса и близко к плоскости Z=0 относительно центра диска
-    return np.hypot(px, py) <= disk_radius and abs(pz) < config.SIM_INTERSECTION_TOLERANCE
-
-
-def _run_simulation_loop(params: dict, calculate_transforms, check_intersection, progress_callback=None, cancel_event=None):
-    """
-    Generic Monte Carlo simulation loop.
-    Общий цикл симуляции Монте-Карло.
-
-    Args:
-        params (dict): Dictionary containing all simulation parameters.
-                       Словарь, содержащий все параметры симуляции.
-        calculate_transforms (callable): Function to calculate time-dependent transforms (source position, rotation matrices).
-                                         Функция для расчета зависящих от времени преобразований (положение источника, матрицы поворота).
-        check_intersection (callable): Function to check if a point intersects the target.
-                                       Функция для проверки пересечения точки с мишенью.
-        progress_callback (callable, optional): Function to report progress (0-100). Defaults to None.
-                                                Функция для сообщения о прогрессе (0-100). По умолчанию None.
-        cancel_event (threading.Event, optional): Event to signal cancellation. Defaults to None.
-                                                  Событие для сигнализации отмены. По умолчанию None.
-
-    Returns:
-        tuple: coverage_map, x_coords, y_coords, radius_grid
-               Карта покрытия, координаты x, координаты y, сетка радиусов
-    """
-    n_particles = params['particles']
-    grid_size = config.SIM_GRID_SIZE
-    target_size = params.get('diameter', params.get('length', params.get('planet_diameter', 1.0))) # Determine relevant size
-                                                                                                   # Определяем релевантный размер
-    radius = target_size / 2.0 # Used for grid setup, actual check uses specific dimensions
-                               # Используется для настройки сетки, фактическая проверка использует конкретные размеры
-
-    # Setup grid
-    # Настройка сетки
-    x_coords = np.linspace(-radius, radius, grid_size)
-    y_coords = np.linspace(-radius, radius, grid_size)
-    xx, yy = np.meshgrid(x_coords, y_coords)
-    radius_grid = np.hypot(xx, yy)
-    coverage_map = np.zeros_like(xx, dtype=int) # Use integers for counts
-
-    # Progress reporting setup
-    # Настройка отчета о прогрессе
-    report_interval = max(1, int(n_particles * config.SIM_PROGRESS_INTERVAL_PERCENT / 100.0))
-    last_report_time = time.time()
-
-    # --- Main Simulation Loop ---
-    for i in range(n_particles):
-        if cancel_event and cancel_event.is_set():
-            print("Simulation cancelled.")
-            break
-
-        # 1. Calculate time-dependent transforms for this particle
-        # 1. Рассчитываем зависящие от времени преобразования для этой частицы
-        t = params['time'] * i / n_particles
-        src_pos_base, source_rotation_matrix, target_rotation_matrix_inv = calculate_transforms(t, params)
-
-        # 2. Sample starting position on the source (local coordinates)
-        # 2. Генерируем начальную позицию на источнике (локальные координаты)
-        local_src_offset = sample_source_position(params['src_type'], params)
-
-        # 3. Transform local source position to global coordinates
-        # 3. Преобразуем локальную позицию источника в глобальные координаты
-        # Apply source rotation first, then add base position
-        # Сначала применяем вращение источника, затем добавляем базовую позицию
-        global_src_pos = src_pos_base + source_rotation_matrix.dot(local_src_offset)
-
-        # 4. Sample emission direction vector (local to source, pointing -Z)
-        # 4. Генерируем вектор направления эмиссии (локально к источнику, направлен по -Z)
-        local_dir_vec = np.array(sample_emission_vector(params['dist_type'], params['max_theta'], params))
-
-        # 5. Transform emission vector to global coordinates
-        # 5. Преобразуем вектор эмиссии в глобальные координаты
-        # Apply source rotation to the local direction vector
-        # Применяем вращение источника к локальному вектору направления
-        global_dir_vec = source_rotation_matrix.dot(local_dir_vec)
-
-        # 6. Ray tracing: Find intersection with target plane/surface
-        # 6. Трассировка лучей: Находим пересечение с плоскостью/поверхностью мишени
-        # Simplified approach: step along the ray and check intersection
-        # Упрощенный подход: шагаем вдоль луча и проверяем пересечение
-        intersected = False
-        for step in np.linspace(0, config.SIM_TRACE_MAX_DIST, config.SIM_TRACE_STEPS):
-            # Current point in global coordinates
-            # Текущая точка в глобальных координатах
-            current_point_global = global_src_pos + global_dir_vec * step
-
-            # Transform point to target's coordinate system (if target moves/rotates)
-            # Преобразуем точку в систему координат мишени (если мишень движется/вращается)
-            point_in_target_frame = target_rotation_matrix_inv.dot(current_point_global)
-
-            # Check for intersection using the provided function
-            # Проверяем пересечение с помощью предоставленной функции
-            if check_intersection(point_in_target_frame, params):
-                # 7. If intersected, find grid cell and increment coverage
-                # 7. Если пересеклись, находим ячейку сетки и увеличиваем покрытие
-                px, py, _ = point_in_target_frame # Use coordinates relative to target center
-
-                # Find the closest grid indices (more robust than searchsorted for float precision)
-                # Находим ближайшие индексы сетки (более надежно, чем searchsorted для точности float)
-                ix = np.argmin(np.abs(x_coords - px))
-                iy = np.argmin(np.abs(y_coords - py))
-
-                # Check if indices are within bounds (should be if point is within radius)
-                # Проверяем, находятся ли индексы в границах (должны быть, если точка в пределах радиуса)
-                if 0 <= ix < grid_size and 0 <= iy < grid_size:
-                     # Check if the point is actually within the cell boundaries represented by the index
-                     # Проверяем, действительно ли точка находится в границах ячейки, представленной индексом
-                     dx = x_coords[1] - x_coords[0] if grid_size > 1 else radius * 2
-                     dy = y_coords[1] - y_coords[0] if grid_size > 1 else radius * 2
-                     if (x_coords[ix] - dx/2 <= px < x_coords[ix] + dx/2 and
-                         y_coords[iy] - dy/2 <= py < y_coords[iy] + dy/2):
-                            coverage_map[iy, ix] += 1
-                intersected = True
-                break # Stop ray tracing once intersection is found
-
-        # --- Progress Reporting ---
-        if progress_callback and (i % report_interval == 0 or i == n_particles - 1):
-            current_time = time.time()
-            if current_time - last_report_time > 0.5 or i == n_particles - 1: # Limit updates to ~2 per second
-                progress = int((i + 1) / n_particles * 100)
-                progress_callback(progress)
-                last_report_time = current_time
-
-    return coverage_map, x_coords, y_coords, radius_grid
-
-
-# --- Specific Simulation Setups ---
-
-def simulate_coating_disk_dome(params: dict, progress_callback=None, cancel_event=None):
-    """Simulation for rotating disk or dome targets."""
-    target_type = params['target_type']
-    diameter = params['diameter']
-    radius = diameter / 2.0
-
-    def calculate_transforms(t, p):
-        # Target rotation
-        # Вращение мишени
-        omega = 2 * math.pi * p['rpm'] / 60.0
-        target_angle = omega * t
-        # Inverse rotation to bring global point to target frame
-        # Обратное вращение для перевода глобальной точки в систему координат мишени
-        target_rot_inv = rotation_matrix([0, 0, 1], -target_angle)
-
-        # Source position and rotation
-        # Положение и вращение источника
-        src_base = np.array([p['src_x'], p['src_y'], p['src_z']]) # Source base position is fixed relative to world
-                                                                  # Базовое положение источника фиксировано относительно мира
-        # Source orientation (combine rotations around X and Y)
-        # Ориентация источника (комбинируем вращения вокруг X и Y)
-        rot_x_rad = math.radians(p['rot_x'])
-        rot_y_rad = math.radians(p['rot_y'])
-        # Apply Y rotation first, then X rotation (or vice versa, be consistent)
-        # Сначала применяем вращение Y, затем вращение X (или наоборот, будьте последовательны)
-        mat_rot_y = rotation_matrix([0, 1, 0], rot_y_rad)
-        mat_rot_x = rotation_matrix([1, 0, 0], rot_x_rad)
-        source_rot = mat_rot_x @ mat_rot_y # Combined rotation matrix
-
-        return src_base, source_rot, target_rot_inv
-
-    def check_intersection(point_in_target_frame, p):
-        if target_type == config.TARGET_DOME:
-            return _check_intersection_dome(point_in_target_frame, p['diameter'], p['dome_radius'])
-        else: # Default to disk
-            return _check_intersection_disk(point_in_target_frame, radius)
-
-    # Update params with specific defaults if missing
-    params.setdefault('rpm', config.DEFAULT_PROCESSING_PARAMS['rpm'])
-
-    return _run_simulation_loop(params, calculate_transforms, check_intersection, progress_callback, cancel_event)
-
-
-def simulate_linear_movement(params: dict, progress_callback=None, cancel_event=None):
-    """Simulation for linearly moving flat target."""
-    length = params['length']
-    width = params['width']
-
-    def calculate_transforms(t, p):
-        # Target does not rotate relative to its own frame, so inverse is identity
-        # Мишень не вращается относительно своей системы координат, поэтому обратное преобразование - единичная матрица
-        target_rot_inv = np.identity(3)
-
-        # Source position: Base is fixed, movement handled by target frame check
-        # Положение источника: База фиксирована, движение обрабатывается проверкой в системе координат мишени
-        src_base = np.array([p['src_x'], p['src_y'], p['src_z']])
-
-        # Source orientation
-        # Ориентация источника
-        rot_x_rad = math.radians(p['rot_x'])
-        rot_y_rad = math.radians(p['rot_y'])
-        mat_rot_y = rotation_matrix([0, 1, 0], rot_y_rad)
-        mat_rot_x = rotation_matrix([1, 0, 0], rot_x_rad)
-        source_rot = mat_rot_x @ mat_rot_y
-
-        # Linear movement: Calculate target offset at time t
-        # Линейное движение: Рассчитываем смещение мишени в момент времени t
-        speed = p['speed']
-        # Movement along X axis, repeating every 'length' distance
-        # Движение вдоль оси X, повторяющееся каждые 'length'
-        # Position oscillates between -length/2 and +length/2
-        # Позиция колеблется между -length/2 и +length/2
-        total_dist = speed * t
-        # Normalize distance within one cycle [0, 2*length)
-        # Нормализуем расстояние в пределах одного цикла [0, 2*length)
-        cycle_dist = total_dist % (2 * length)
-        if cycle_dist < length:
-             # Moving from -L/2 to +L/2
-             # Движемся от -L/2 к +L/2
-             target_offset_x = -length / 2.0 + cycle_dist
+def _calculate_transforms_linear(t: float, p: dict):
+    physical_length = p['length']
+    source_x_world = p['src_x']
+    overrun_value = abs(p.get('src_x', 0.0)) 
+    src_base = np.array([source_x_world, p['src_y'], p['src_z']])
+    rot_x_rad = math.radians(p['rot_x']); rot_y_rad = math.radians(p['rot_y'])
+    mat_rot_y = rotation_matrix([0, 1, 0], rot_y_rad); mat_rot_x = rotation_matrix([1, 0, 0], rot_x_rad)
+    source_rot = mat_rot_x @ mat_rot_y
+    speed = p['speed']
+    total_dist_travelled_by_center = speed * t
+    min_center_substrate_x = source_x_world - (physical_length / 2.0) - overrun_value
+    max_center_substrate_x = source_x_world + (physical_length / 2.0) + overrun_value
+    travel_length_one_way = max_center_substrate_x - min_center_substrate_x
+    cycle_path_length = 2 * travel_length_one_way
+    if cycle_path_length <= 1e-9: target_offset_x = source_x_world
+    else:
+        current_pos_in_cycle = total_dist_travelled_by_center % cycle_path_length
+        if current_pos_in_cycle < travel_length_one_way:
+            target_offset_x = min_center_substrate_x + current_pos_in_cycle
         else:
-             # Moving from +L/2 to -L/2
-             # Движемся от +L/2 к -L/2
-             target_offset_x = length / 2.0 - (cycle_dist - length)
+            target_offset_x = max_center_substrate_x - (current_pos_in_cycle - travel_length_one_way)
+    target_offset = np.array([target_offset_x, 0.0, 0.0])
+    return src_base, source_rot, target_offset
 
-        # We need to transform the global point into the *moving* target frame.
-        # This means subtracting the target's offset from the global point.
-        # The `target_rot_inv` will include this translation.
-        # Нам нужно преобразовать глобальную точку в *движущуюся* систему координат мишени.
-        # Это означает вычитание смещения мишени из глобальной точки.
-        # `target_rot_inv` будет включать это смещение.
+def _calculate_transforms_planetary(t: float, p: dict):
+    orbital_radius = p['orbit_diameter'] / 2.0
+    omega_orb = 2 * math.pi * p['rpm_orbit'] / 60.0; omega_self = 2 * math.pi * p['rpm_disk'] / 60.0
+    angle_orbit = omega_orb * t; angle_self = omega_self * t
+    target_center_x = orbital_radius * math.cos(angle_orbit); target_center_y = orbital_radius * math.sin(angle_orbit)
+    target_center_at_t = np.array([target_center_x, target_center_y, 0.0])
+    inv_target_self_rot_matrix = rotation_matrix([0, 0, 1], -angle_self)
+    src_base = np.array([p['src_x'], p['src_y'], p['src_z']])
+    rot_x_rad = math.radians(p['rot_x']); rot_y_rad = math.radians(p['rot_y'])
+    mat_rot_y = rotation_matrix([0, 1, 0], rot_y_rad); mat_rot_x = rotation_matrix([1, 0, 0], rot_x_rad)
+    source_rot = mat_rot_x @ mat_rot_y
+    return src_base, source_rot, (target_center_at_t, inv_target_self_rot_matrix)
 
-        # Create a translation matrix for the inverse transform
-        # Создаем матрицу сдвига для обратного преобразования
-        # Since target_rot_inv is applied as M*point, we need a 4x4 matrix approach or adjust the point before check_intersection
-        # Так как target_rot_inv применяется как M*point, нам нужен подход с матрицами 4x4 или корректировка точки перед check_intersection
-        # Simpler: Adjust the point inside check_intersection or modify the check function signature.
-        # Проще: Скорректировать точку внутри check_intersection или изменить сигнатуру функции проверки.
-        # Let's pass the offset to the check function.
+def _simulation_mp_worker(args_tuple):
+    worker_id, start_particle_idx, num_particles_in_chunk, params, \
+    calculate_transforms_for_analytical, check_intersection_analytical, \
+    progress_q, cancel_event_is_set_func = args_tuple
 
-        # Return the offset instead of target_rot_inv for this type
-        # Возвращаем смещение вместо target_rot_inv для этого типа
-        target_offset = np.array([target_offset_x, 0.0, 0.0])
+    # grid_size теперь означает количество ГРАНИЦ ячеек
+    num_edges = config.SIM_GRID_SIZE 
+    num_cells = num_edges - 1
 
-        # Revisit: The _run_simulation_loop expects target_rotation_matrix_inv.
-        # We need a way to handle the translation.
-        # Пересмотр: _run_simulation_loop ожидает target_rotation_matrix_inv.
-        # Нам нужен способ обработки смещения.
-        # Option 1: Modify loop to handle translation separately.
-        # Option 2: Use 4x4 matrices (more complex).
-        # Option 3: Adjust the point *before* calling check_intersection.
+    target_type = params.get('target_type')
 
-        # Let's go with Option 3 for now. The check function will implicitly handle the frame.
-        # Пока выберем Вариант 3. Функция проверки неявно обработает систему координат.
-        # The check_intersection_linear assumes the point is already in the target's *static* frame.
-        # check_intersection_linear предполагает, что точка уже находится в *статической* системе координат мишени.
-        # So, point_in_target_frame = point_global - target_offset
+    if target_type == config.TARGET_LINEAR:
+        grid_x_radius = params.get('length', 1.0) / 2.0
+        grid_y_radius = params.get('width', 1.0) / 2.0
+    elif target_type == config.TARGET_PLANETARY:
+        grid_x_radius = params.get('planet_diameter', 1.0) / 2.0
+        grid_y_radius = grid_x_radius
+    else: # Disk, Dome
+        grid_x_radius = params.get('diameter', 1.0) / 2.0
+        grid_y_radius = grid_x_radius
+    
+    if grid_x_radius <=0 or grid_y_radius <=0:
+        grid_x_radius = max(grid_x_radius, 1.0)
+        grid_y_radius = max(grid_y_radius, 1.0)
 
-        # We still need to return *something* for target_rotation_matrix_inv. Identity is fine.
-        # Нам все еще нужно вернуть *что-то* для target_rotation_matrix_inv. Единичная матрица подойдет.
+    # Координаты ГРАНИЦ ячеек
+    x_coords_edges = np.linspace(-grid_x_radius, grid_x_radius, num_edges)
+    y_coords_edges = np.linspace(-grid_y_radius, grid_y_radius, num_edges)
+    
+    # Карта покрытия теперь имеет размер (количество ячеек Y, количество ячеек X)
+    local_coverage_map = np.zeros((num_cells, num_cells), dtype=np.int32)
 
-        return src_base, source_rot, np.identity(3), target_offset # Return offset separately
+    # Границы всей сетки
+    x_grid_min_edge = x_coords_edges[0]
+    x_grid_max_edge = x_coords_edges[-1]
+    y_grid_min_edge = y_coords_edges[0]
+    y_grid_max_edge = y_coords_edges[-1]
+    
+    particles_processed_in_chunk_total = 0
+    if progress_q:
+        progress_q.put((worker_id, 0, num_particles_in_chunk))
+    
+    outer_vectorized_batch_size = 1024 
+    mini_batch_size_for_transforms = params.get('mini_batch_size', 64)
+    if mini_batch_size_for_transforms <= 0:
+        mini_batch_size_for_transforms = 64 
+    
+    report_chunk_interval_counter = 0
+    report_after_N_particles_processed = max(1, num_particles_in_chunk // 20)
+
+    for i_outer_batch_start in range(0, num_particles_in_chunk, outer_vectorized_batch_size):
+        if cancel_event_is_set_func and cancel_event_is_set_func(): break
+        
+        current_outer_batch_size = min(outer_vectorized_batch_size, num_particles_in_chunk - i_outer_batch_start)
+        if current_outer_batch_size <= 0: break
+
+        global_particle_indices_outer = np.arange(
+            start_particle_idx + i_outer_batch_start, 
+            start_particle_idx + i_outer_batch_start + current_outer_batch_size
+        )
+        total_particles_for_time = params.get('total_particles_for_time_calc', params['particles'])
+
+        local_src_offsets_array_outer = sample_source_position_vectorized(params['src_type'], params, current_outer_batch_size)
+        local_dir_vectors_array_outer = sample_emission_vector_vectorized(params['dist_type'], params['max_theta'], params, current_outer_batch_size)
+
+        for i_mini_batch_start_in_outer in range(0, current_outer_batch_size, mini_batch_size_for_transforms):
+            if cancel_event_is_set_func and cancel_event_is_set_func(): break
+
+            current_mini_batch_size = min(mini_batch_size_for_transforms, current_outer_batch_size - i_mini_batch_start_in_outer)
+            if current_mini_batch_size <= 0: break
+
+            mini_batch_slice = slice(i_mini_batch_start_in_outer, i_mini_batch_start_in_outer + current_mini_batch_size)
+            first_global_idx_in_mini_batch = global_particle_indices_outer[i_mini_batch_start_in_outer]
+            t_first_in_mini_batch = params['time'] * first_global_idx_in_mini_batch / total_particles_for_time if total_particles_for_time > 1 else 0
+            
+            src_pos_base_global, source_rotation_matrix, target_transform_info = \
+                calculate_transforms_for_analytical(t_first_in_mini_batch, params)
+
+            current_local_src_offsets = local_src_offsets_array_outer[:, mini_batch_slice]
+            current_local_dir_vectors = local_dir_vectors_array_outer[:, mini_batch_slice]
+
+            global_ray_origins_array = src_pos_base_global[:, np.newaxis] + source_rotation_matrix @ current_local_src_offsets
+            global_ray_directions_array = source_rotation_matrix @ current_local_dir_vectors
+            
+            norms = np.linalg.norm(global_ray_directions_array, axis=0)
+            valid_norms_mask = norms > 1e-9
+            global_ray_directions_array[:, valid_norms_mask] /= norms[valid_norms_mask][np.newaxis, :]
+
+            if target_type in [config.TARGET_DISK, config.TARGET_DOME]:
+                target_rotation_matrix_inv = target_transform_info
+                ray_origins_tf_array = target_rotation_matrix_inv @ global_ray_origins_array
+                ray_directions_tf_array = target_rotation_matrix_inv @ global_ray_directions_array
+            elif target_type == config.TARGET_LINEAR:
+                target_offset_at_t = target_transform_info
+                ray_origins_tf_array = global_ray_origins_array - target_offset_at_t[:, np.newaxis]
+                ray_directions_tf_array = global_ray_directions_array
+            elif target_type == config.TARGET_PLANETARY:
+                target_center_at_t, inv_target_self_rot_matrix = target_transform_info
+                ray_origins_rel_center_array = global_ray_origins_array - target_center_at_t[:, np.newaxis]
+                ray_origins_tf_array = inv_target_self_rot_matrix @ ray_origins_rel_center_array
+                ray_directions_tf_array = inv_target_self_rot_matrix @ global_ray_directions_array
+            else:
+                ray_origins_tf_array = global_ray_origins_array
+                ray_directions_tf_array = global_ray_directions_array
+
+            intersection_points_on_target_3d_array = check_intersection_analytical(
+                ray_origins_tf_array, ray_directions_tf_array, params
+            )
+
+            if intersection_points_on_target_3d_array is not None:
+                valid_hits_mask_initial = ~np.isnan(intersection_points_on_target_3d_array[0,:])
+                if np.any(valid_hits_mask_initial):
+                    px_hits_all = intersection_points_on_target_3d_array[0, valid_hits_mask_initial]
+                    py_hits_all = intersection_points_on_target_3d_array[1, valid_hits_mask_initial]
+                    
+                    # Проверка попадания в ОБЩИЕ ГРАНИЦЫ СЕТКИ
+                    # Частицы на самой правой/верхней границе исключаются (стандарт для гистограмм)
+                    grid_bounds_mask = (
+                        (px_hits_all >= x_grid_min_edge) & (px_hits_all < x_grid_max_edge) &
+                        (py_hits_all >= y_grid_min_edge) & (py_hits_all < y_grid_max_edge)
+                    )
+                    
+                    px_hits_in_grid = px_hits_all[grid_bounds_mask]
+                    py_hits_in_grid = py_hits_all[grid_bounds_mask]
+
+                    if px_hits_in_grid.size > 0:
+                        # searchsorted с границами ячеек возвращает индекс ячейки
+                        ix_hits = np.searchsorted(x_coords_edges, px_hits_in_grid, side='right') - 1
+                        iy_hits = np.searchsorted(y_coords_edges, py_hits_in_grid, side='right') - 1
+                        
+                        # Клиппинг по индексам ячеек (0 до num_cells - 1)
+                        ix_hits = np.clip(ix_hits, 0, num_cells - 1)
+                        iy_hits = np.clip(iy_hits, 0, num_cells - 1)
+                        
+                        np.add.at(local_coverage_map, (iy_hits, ix_hits), 1)
+            
+            particles_processed_in_chunk_total += current_mini_batch_size
+            report_chunk_interval_counter += current_mini_batch_size
+
+            if progress_q and (report_chunk_interval_counter >= report_after_N_particles_processed or \
+                               particles_processed_in_chunk_total == num_particles_in_chunk) :
+                 progress_q.put((worker_id, particles_processed_in_chunk_total, num_particles_in_chunk))
+                 report_chunk_interval_counter = 0
+
+        if cancel_event_is_set_func and cancel_event_is_set_func(): break
+
+    if progress_q:
+        progress_q.put((worker_id, particles_processed_in_chunk_total, num_particles_in_chunk))
+    return local_coverage_map
 
 
-    def check_intersection_moving(point_global, p, target_offset_at_t):
-         # Transform global point to the target's frame at this instant
-         # Преобразуем глобальную точку в систему координат мишени в данный момент
-         point_in_target_frame = point_global - target_offset_at_t
-         return _check_intersection_linear(point_in_target_frame, p['length'], p['width'])
+def _run_simulation_multiprocessed(params: dict,
+                                   calculate_transforms_func,
+                                   check_intersection_func,
+                                   progress_q=None,
+                                   cancel_event=None):
+    n_particles_total = params['particles']
+    if n_particles_total == 0:
+        return _get_empty_map_data(params, progress_q) # Передаем progress_q
 
-    # Modify the simulation loop call slightly to handle the extra offset argument
-    # Немного изменим вызов цикла симуляции для обработки дополнительного аргумента смещения
+    num_cores = os.cpu_count()
+    if n_particles_total <= 20000: num_workers = max(1, min(num_cores if num_cores else 1, 2))
+    elif n_particles_total <= 100000: num_workers = max(1, (num_cores if num_cores else 1) // 2 if (num_cores if num_cores else 1) > 2 else (num_cores if num_cores else 1))
+    else: num_workers = max(1, (num_cores if num_cores else 1) - 1 if (num_cores if num_cores else 1) > 1 else 1)
+    min_sensible_chunk_per_worker = 5000
+    if num_workers > 0 and n_particles_total / num_workers < min_sensible_chunk_per_worker and num_workers > 1:
+        num_workers = max(1, math.ceil(n_particles_total / min_sensible_chunk_per_worker))
+    num_workers = min(num_workers, n_particles_total if n_particles_total > 0 else 1)
+    num_workers = max(1, num_workers)
+    chunk_size = math.ceil(n_particles_total / num_workers) if num_workers > 0 else n_particles_total
+    if chunk_size == 0 and n_particles_total > 0 : chunk_size = n_particles_total
+    print(f"DEBUG: Всего частиц: {n_particles_total}, Ядер CPU: {num_cores}, Выбрано воркеров: {num_workers}, Размер чанка: {chunk_size}")
 
-    # --- Modified Simulation Loop Call ---
-    n_particles = params['particles']
-    grid_size = config.SIM_GRID_SIZE
-    radius = params['length'] / 2.0 # Use length for grid setup
+    params_with_total_particles = params.copy()
+    params_with_total_particles['total_particles_for_time_calc'] = n_particles_total
+    tasks_args = []
+    current_start_idx = 0
+    for i in range(num_workers):
+        num_in_this_chunk = min(chunk_size, n_particles_total - current_start_idx)
+        if num_in_this_chunk <= 0: break
+        tasks_args.append((
+            i, current_start_idx, num_in_this_chunk, params_with_total_particles,
+            calculate_transforms_func, check_intersection_func,
+            progress_q, cancel_event.is_set if cancel_event else lambda: False
+        ))
+        current_start_idx += num_in_this_chunk
+    
+    list_of_local_coverage_maps = []
+    pool = None
+    try:
+        pool = multiprocessing.Pool(processes=num_workers)
+        async_results = pool.map_async(_simulation_mp_worker, tasks_args)
+        while not async_results.ready():
+            if cancel_event and cancel_event.is_set():
+                print("Отмена симуляции (замечено в _run_simulation_multiprocessed)")
+                pool.terminate(); pool.join()
+                return _get_empty_map_data(params)
+            time.sleep(0.05)
+        pool.close(); pool.join()
+        if async_results.successful(): list_of_local_coverage_maps = async_results.get()
+        else:
+            try: async_results.get()
+            except Exception as e_worker: print(f"Ошибка из воркера: {e_worker}"); raise e_worker
+            raise RuntimeError("Ошибка выполнения в одном из дочерних процессов симуляции (неизвестная).")
+    except (KeyboardInterrupt, SystemExit):
+        print("Симуляция прервана KeyboardInterrupt/SystemExit")
+        if pool is not None: pool.terminate(); pool.join()
+        return _get_empty_map_data(params)
+    except Exception as e_pool:
+        print(f"Общая ошибка при работе с пулом: {e_pool}")
+        if pool is not None: pool.terminate(); pool.join()
+        raise e_pool
 
-    x_coords = np.linspace(-radius, radius, grid_size)
-    y_coords = np.linspace(-params['width'] / 2.0, params['width'] / 2.0, grid_size) # Adjust Y grid for width
-                                                                                      # Корректируем сетку Y по ширине
-    xx, yy = np.meshgrid(x_coords, y_coords)
-    radius_grid = np.hypot(xx, yy) # Note: rr is less meaningful here
-                                   # Примечание: rr здесь менее значим
-    coverage_map = np.zeros_like(xx, dtype=int)
+    if not list_of_local_coverage_maps or not any(m is not None for m in list_of_local_coverage_maps):
+        print("Не получено карт покрытия от воркеров или все они None.")
+        return _get_empty_map_data(params)
 
-    report_interval = max(1, int(n_particles * config.SIM_PROGRESS_INTERVAL_PERCENT / 100.0))
-    last_report_time = time.time()
+    # Суммируем карты покрытия, они уже правильного размера (num_cells, num_cells)
+    final_coverage_map = np.sum(np.array([m for m in list_of_local_coverage_maps if m is not None]), axis=0).astype(np.int32)
+    
+    # --- Возвращаем ГРАНИЦЫ ячеек и RADIUS_GRID на основе ЦЕНТРОВ ячеек ---
+    num_edges_final = config.SIM_GRID_SIZE
+    num_cells_final = num_edges_final - 1
+    target_type_final = params.get('target_type')
 
-    for i in range(n_particles):
-        if cancel_event and cancel_event.is_set():
-            print("Simulation cancelled.")
-            break
+    if target_type_final == config.TARGET_LINEAR:
+        grid_x_rad_final = params.get('length', 1.0) / 2.0
+        grid_y_rad_final = params.get('width', 1.0) / 2.0
+    elif target_type_final == config.TARGET_PLANETARY:
+        grid_x_rad_final = params.get('planet_diameter', 1.0) / 2.0
+        grid_y_rad_final = grid_x_rad_final
+    else: # Disk, Dome
+        grid_x_rad_final = params.get('diameter', 1.0) / 2.0
+        grid_y_rad_final = grid_x_rad_final
+    
+    if grid_x_rad_final <=0 or grid_y_rad_final <=0:
+        grid_x_rad_final = max(grid_x_rad_final, 1.0); grid_y_rad_final = max(grid_y_rad_final, 1.0)
 
-        t = params['time'] * i / n_particles
-        src_pos_base, source_rotation_matrix, _, target_offset = calculate_transforms(t, params) # Get offset
+    x_coords_edges_final = np.linspace(-grid_x_rad_final, grid_x_rad_final, num_edges_final)
+    y_coords_edges_final = np.linspace(-grid_y_rad_final, grid_y_rad_final, num_edges_final)
+    
+    # Координаты центров ячеек
+    x_centers_final = (x_coords_edges_final[:-1] + x_coords_edges_final[1:]) / 2.0
+    y_centers_final = (y_coords_edges_final[:-1] + y_coords_edges_final[1:]) / 2.0
+    
+    xx_centers, yy_centers = np.meshgrid(x_centers_final, y_centers_final) # Meshgrid для центров
+    radius_grid_at_centers = np.hypot(xx_centers, yy_centers) # (num_cells_y, num_cells_x)
+    
+    # Проверка формы final_coverage_map
+    if final_coverage_map.shape[0] != num_cells_final or final_coverage_map.shape[1] != num_cells_final:
+        print(f"Предупреждение: форма final_coverage_map ({final_coverage_map.shape}) не совпадает с ожидаемой ({num_cells_final}, {num_cells_final}).")
+        # Попытка изменить форму, если общее количество элементов совпадает
+        if final_coverage_map.size == num_cells_final * num_cells_final:
+            try:
+                final_coverage_map = final_coverage_map.reshape((num_cells_final, num_cells_final))
+                print("Форма карты покрытия была скорректирована.")
+            except ValueError:
+                print("Не удалось скорректировать форму карты покрытия. Возвращаем пустую карту.")
+                return _get_empty_map_data(params)
+        else:
+            print("Размер карты покрытия не соответствует ожидаемому. Возвращаем пустую карту.")
+            return _get_empty_map_data(params)
+            
+    return final_coverage_map, x_coords_edges_final, y_coords_edges_final, radius_grid_at_centers
 
-        local_src_offset = sample_source_position(params['src_type'], params)
-        global_src_pos = src_pos_base + source_rotation_matrix.dot(local_src_offset)
+def _get_empty_map_data(params: dict, progress_q=None) -> tuple: # Добавлен progress_q
+    num_edges = config.SIM_GRID_SIZE
+    num_cells = num_edges - 1
+    target_type = params.get('target_type')
 
-        local_dir_vec = np.array(sample_emission_vector(params['dist_type'], params['max_theta'], params))
-        global_dir_vec = source_rotation_matrix.dot(local_dir_vec)
+    if target_type == config.TARGET_LINEAR:
+        grid_x_radius = params.get('length', 1.0) / 2.0; grid_y_radius = params.get('width', 1.0) / 2.0
+    elif target_type == config.TARGET_PLANETARY:
+        grid_x_radius = params.get('planet_diameter', 1.0) / 2.0; grid_y_radius = grid_x_radius
+    else: # Disk, Dome
+        grid_x_radius = params.get('diameter', 1.0) / 2.0; grid_y_radius = grid_x_radius
+    
+    if grid_x_radius <=0 or grid_y_radius <=0:
+        grid_x_radius = max(grid_x_radius, 1.0); grid_y_radius = max(grid_y_radius, 1.0)
+    
+    x_coords_edges = np.linspace(-grid_x_radius, grid_x_radius, num_edges)
+    y_coords_edges = np.linspace(-grid_y_radius, grid_y_radius, num_edges)
+    
+    coverage_map = np.zeros((num_cells, num_cells), dtype=np.int32) # Карта размера ячеек
+    
+    x_centers = (x_coords_edges[:-1] + x_coords_edges[1:]) / 2.0
+    y_centers = (y_coords_edges[:-1] + y_coords_edges[1:]) / 2.0
+    xx_centers, yy_centers = np.meshgrid(x_centers, y_centers)
+    radius_grid_at_centers = np.hypot(xx_centers, yy_centers)
+    
+    if progress_q and hasattr(progress_q, 'put'): progress_q.put(100) # Если 0 частиц, считаем завершенным
 
-        intersected = False
-        for step in np.linspace(0, config.SIM_TRACE_MAX_DIST, config.SIM_TRACE_STEPS):
-            current_point_global = global_src_pos + global_dir_vec * step
+    return coverage_map, x_coords_edges, y_coords_edges, radius_grid_at_centers
 
-            # Check intersection using the moving frame logic
-            # Проверяем пересечение, используя логику движущейся системы координат
-            if check_intersection_moving(current_point_global, params, target_offset):
-                # Point relative to target center *at this time t*
-                # Точка относительно центра мишени *в данный момент времени t*
-                point_in_target_frame = current_point_global - target_offset
-                px, py, _ = point_in_target_frame
+def simulate_coating_disk_dome_mp(params: dict, progress_q=None, cancel_event=None):
+    target_type = params['target_type']
+    calculate_transforms_func = _calculate_transforms_disk_dome
+    check_func = _check_intersection_dome_analytical if target_type == config.TARGET_DOME else _check_intersection_disk_analytical
+    params.setdefault('rpm', config.DEFAULT_PROCESSING_PARAMS['rpm'])
+    params.setdefault('mini_batch_size', config.DEFAULT_PROCESSING_PARAMS['mini_batch_size'])
+    return _run_simulation_multiprocessed(params, calculate_transforms_func, check_func, progress_q, cancel_event)
 
-                ix = np.argmin(np.abs(x_coords - px))
-                iy = np.argmin(np.abs(y_coords - py))
+def simulate_linear_movement_mp(params: dict, progress_q=None, cancel_event=None):
+    calculate_transforms_func = _calculate_transforms_linear
+    params.setdefault('speed', config.DEFAULT_PROCESSING_PARAMS['speed'])
+    params.setdefault('src_x', 0.0) 
+    params.setdefault('mini_batch_size', config.DEFAULT_PROCESSING_PARAMS['mini_batch_size'])
+    return _run_simulation_multiprocessed(params, calculate_transforms_func, _check_intersection_linear_analytical, progress_q, cancel_event)
 
-                if 0 <= ix < grid_size and 0 <= iy < grid_size:
-                     dx = x_coords[1] - x_coords[0] if grid_size > 1 else length
-                     dy = y_coords[1] - y_coords[0] if grid_size > 1 else params['width']
-                     if (x_coords[ix] - dx/2 <= px < x_coords[ix] + dx/2 and
-                         y_coords[iy] - dy/2 <= py < y_coords[iy] + dy/2):
-                            coverage_map[iy, ix] += 1
-                intersected = True
-                break
+def simulate_planetary_mp(params: dict, progress_q=None, cancel_event=None):
+    calculate_transforms_func = _calculate_transforms_planetary
+    params.setdefault('rpm_disk', config.DEFAULT_PROCESSING_PARAMS['rpm_disk'])
+    params.setdefault('rpm_orbit', config.DEFAULT_PROCESSING_PARAMS['rpm_orbit'])
+    params.setdefault('mini_batch_size', config.DEFAULT_PROCESSING_PARAMS['mini_batch_size'])
+    return _run_simulation_multiprocessed(params, calculate_transforms_func, _check_intersection_planetary_disk_analytical, progress_q, cancel_event)
 
-        if progress_callback and (i % report_interval == 0 or i == n_particles - 1):
-             current_time = time.time()
-             if current_time - last_report_time > 0.5 or i == n_particles - 1:
-                 progress = int((i + 1) / n_particles * 100)
-                 progress_callback(progress)
-                 last_report_time = current_time
-
-    return coverage_map, x_coords, y_coords, radius_grid # Return adjusted y_coords
-
-
-def simulate_planetary(params: dict, progress_callback=None, cancel_event=None):
-    """Simulation for planetary target motion."""
-    disk_diameter = params['planet_diameter']
-    disk_radius = disk_diameter / 2.0
-    orbital_radius = params['orbit_diameter'] / 2.0
-
-    def calculate_transforms(t, p):
-        # Orbital and self-rotation speeds
-        # Скорости орбитального и собственного вращения
-        omega_orb = 2 * math.pi * p['rpm_orbit'] / 60.0
-        omega_self = 2 * math.pi * p['rpm_disk'] / 60.0
-
-        # Angles at time t
-        # Углы в момент времени t
-        angle_orbit = omega_orb * t
-        angle_self = omega_self * t # Disk's own rotation
-
-        # Target center position due to orbital motion
-        # Положение центра мишени из-за орбитального движения
-        target_center_x = orbital_radius * math.cos(angle_orbit)
-        target_center_y = orbital_radius * math.sin(angle_orbit)
-        target_center = np.array([target_center_x, target_center_y, 0.0])
-
-        # Inverse transform matrix to bring global point to target frame:
-        # 1. Translate by -target_center
-        # 2. Rotate by -angle_self around Z axis
-        # Матрица обратного преобразования для перевода глобальной точки в систему координат мишени:
-        # 1. Сдвиг на -target_center
-        # 2. Поворот на -angle_self вокруг оси Z
-        # Again, handling translation within rotation matrix requires 4x4 or separate step.
-        # Снова, обработка сдвига в матрице поворота требует 4x4 или отдельного шага.
-        # Let's pass center and self_angle separately to the check function / loop.
-        # Передадим центр и собственный угол отдельно в функцию проверки / цикл.
-
-        # Source position and rotation (same as disk/dome case)
-        # Положение и вращение источника (так же, как в случае диска/купола)
-        src_base = np.array([p['src_x'], p['src_y'], p['src_z']])
-        rot_x_rad = math.radians(p['rot_x'])
-        rot_y_rad = math.radians(p['rot_y'])
-        mat_rot_y = rotation_matrix([0, 1, 0], rot_y_rad)
-        mat_rot_x = rotation_matrix([1, 0, 0], rot_x_rad)
-        source_rot = mat_rot_x @ mat_rot_y
-
-        # Return components needed for transformation within the loop
-        # Возвращаем компоненты, необходимые для преобразования внутри цикла
-        return src_base, source_rot, target_center, angle_self
-
-    # --- Modified Simulation Loop Call for Planetary ---
-    n_particles = params['particles']
-    grid_size = config.SIM_GRID_SIZE
-    radius = disk_radius # Grid based on planet disk size
-
-    x_coords = np.linspace(-radius, radius, grid_size)
-    y_coords = np.linspace(-radius, radius, grid_size)
-    xx, yy = np.meshgrid(x_coords, y_coords)
-    radius_grid = np.hypot(xx, yy)
-    coverage_map = np.zeros_like(xx, dtype=int)
-
-    report_interval = max(1, int(n_particles * config.SIM_PROGRESS_INTERVAL_PERCENT / 100.0))
-    last_report_time = time.time()
-
-    for i in range(n_particles):
-        if cancel_event and cancel_event.is_set():
-            print("Simulation cancelled.")
-            break
-
-        t = params['time'] * i / n_particles
-        src_pos_base, source_rotation_matrix, target_center_at_t, target_self_angle_at_t = calculate_transforms(t, params)
-
-        local_src_offset = sample_source_position(params['src_type'], params)
-        global_src_pos = src_pos_base + source_rotation_matrix.dot(local_src_offset)
-
-        local_dir_vec = np.array(sample_emission_vector(params['dist_type'], params['max_theta'], params))
-        global_dir_vec = source_rotation_matrix.dot(local_dir_vec)
-
-        intersected = False
-        for step in np.linspace(0, config.SIM_TRACE_MAX_DIST, config.SIM_TRACE_STEPS):
-            current_point_global = global_src_pos + global_dir_vec * step
-
-            # Transform point to the planetary disk's frame
-            # 1. Translate relative to the moving center
-            # 2. Rotate opposite to the disk's self-rotation
-            # Преобразуем точку в систему координат планетарного диска
-            # 1. Сдвигаем относительно движущегося центра
-            # 2. Вращаем в направлении, противоположном собственному вращению диска
-            point_relative_to_center = current_point_global - target_center_at_t
-            inv_self_rot_matrix = rotation_matrix([0, 0, 1], -target_self_angle_at_t)
-            point_in_target_frame = inv_self_rot_matrix.dot(point_relative_to_center)
-
-            # Check intersection with the disk in its own frame
-            # Проверяем пересечение с диском в его собственной системе координат
-            if _check_intersection_planetary_disk(point_in_target_frame, disk_radius):
-                px, py, _ = point_in_target_frame
-
-                ix = np.argmin(np.abs(x_coords - px))
-                iy = np.argmin(np.abs(y_coords - py))
-
-                if 0 <= ix < grid_size and 0 <= iy < grid_size:
-                     dx = x_coords[1] - x_coords[0] if grid_size > 1 else radius * 2
-                     dy = y_coords[1] - y_coords[0] if grid_size > 1 else radius * 2
-                     if (x_coords[ix] - dx/2 <= px < x_coords[ix] + dx/2 and
-                         y_coords[iy] - dy/2 <= py < y_coords[iy] + dy/2):
-                            coverage_map[iy, ix] += 1
-                intersected = True
-                break
-
-        if progress_callback and (i % report_interval == 0 or i == n_particles - 1):
-             current_time = time.time()
-             if current_time - last_report_time > 0.5 or i == n_particles - 1:
-                 progress = int((i + 1) / n_particles * 100)
-                 progress_callback(progress)
-                 last_report_time = current_time
-
-    return coverage_map, x_coords, y_coords, radius_grid
