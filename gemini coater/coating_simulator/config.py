@@ -12,7 +12,7 @@ TARGET_DOME = "купол"
 TARGET_LINEAR = "линейное перемещение"
 TARGET_PLANETARY = "планетарный"
 
-TARGET_TYPES = [TARGET_DISK, TARGET_DOME, TARGET_LINEAR, TARGET_PLANETARY]
+TARGET_TYPES = [TARGET_DISK, TARGET_DOME, TARGET_LINEAR, TARGET_PLANETARY] # <<< ВОССТАНОВЛЕНО
 
 # --- Source Types ---
 SOURCE_POINT = "точечный"
@@ -20,14 +20,14 @@ SOURCE_RING = "кольцевой"
 SOURCE_CIRCULAR = "круглый"
 SOURCE_LINEAR = "линейный"
 
-SOURCE_TYPES = [SOURCE_POINT, SOURCE_RING, SOURCE_CIRCULAR, SOURCE_LINEAR]
+SOURCE_TYPES = [SOURCE_POINT, SOURCE_RING, SOURCE_CIRCULAR, SOURCE_LINEAR] # <<< ВОССТАНОВЛЕНО
 
 # --- Emission Distribution Types ---
 DIST_GAUSSIAN = "Gaussian beam"
 DIST_COSINE_POWER = "Cosine-power (cosᵐθ)"
 DIST_UNIFORM_SOLID = "Uniform solid angle"
 
-DISTRIBUTION_TYPES = [DIST_GAUSSIAN, DIST_COSINE_POWER, DIST_UNIFORM_SOLID]
+DISTRIBUTION_TYPES = [DIST_GAUSSIAN, DIST_COSINE_POWER, DIST_UNIFORM_SOLID] # <<< ВОССТАНОВЛЕНО
 
 # --- Default Values ---
 DEFAULT_TARGET_PARAMS = {
@@ -40,72 +40,144 @@ DEFAULT_TARGET_PARAMS = {
 }
 
 DEFAULT_SOURCE_PARAMS = {
-    "src_x": 0.0, # Изменено на 0 для симметричного старта линейного движения по умолчанию
+    "src_x": 0.0,
     "src_y": 0.0,
     "src_z": 900.0,
     "rot_x": 0.0,
     "rot_y": 0.0,
     "src_diameter": 100.0,
     "cone_angle": 60.0,
-    "focus_point": "∞",
+    "focus_point": "∞", # Используем константу INFINITY_SYMBOL ниже
     "src_length": 100.0,
     "src_angle": 0.0,
 }
 
 DEFAULT_EMISSION_PARAMS = {
-    "max_theta": 30.0, 
-    "particles": 10000, # Будет преобразовано в 1 x 10^4 в GUI
-    "sigma": 1.0,
-    "m_exp": 1.0,
+    "max_theta": 30.0, # Половинный угол эмиссии в градусах
+    "particles": 10000,
+    "sigma": 1.0,      # Для Gaussian beam, в градусах
+    "m_exp": 1.0,      # Для Cosine-power
 }
 
 DEFAULT_PROCESSING_PARAMS = {
     "rpm": 10.0,
-    "rpm_disk": 10.0,
-    "rpm_orbit": 1.0,
-    "speed": 100.0, # Увеличена скорость по умолчанию для линейного
-    "time": 2.0,
-    "mini_batch_size": 64, # <--- НОВЫЙ ПАРАМЕТР: Размер мини-пачки для пересчета трансформаций
+    "rpm_disk": 10.0,       # Для планетарного
+    "rpm_orbit": 1.0,       # Для планетарного
+    "speed": 100.0,         # Для линейного перемещения (мм/с)
+    "time": 2.0,            # Общее время симуляции (с)
+    "mini_batch_size": 64,  # Размер мини-пакета для пересчета трансформаций
 }
 
 # --- Simulation Parameters ---
-SIM_GRID_SIZE = 200
-# SIM_TRACE_STEPS = 500 # Больше не используется с аналитическим методом
-# SIM_TRACE_MAX_DIST = 2000.0 # Больше не используется с аналитическим методом
-SIM_INTERSECTION_TOLERANCE = 1e-3 # Уменьшена для большей точности с аналитикой
-SIM_PROGRESS_INTERVAL_PERCENT = 5 # Для _run_simulation_loop (старый), в MP обновляется чаще
+SIM_GRID_SIZE = 200 # Количество ГРАНИЦ ячеек сетки (количество ячеек будет на 1 меньше)
+SIM_INTERSECTION_TOLERANCE = 1e-3 # Допуск для проверки пересечения луча с поверхностью
+SIM_PROGRESS_INTERVAL_PERCENT = 5 # Не используется напрямую в MP, но может быть полезно
 
 # --- Visualization Parameters ---
 VIS_PROFILE_BINS = 100
 VIS_DEFAULT_PERCENT = True
 VIS_DEFAULT_LOGSCALE = False
-VIS_DEFAULT_SHOW3D = False
+VIS_DEFAULT_SHOW3D = False # Не используется в текущей 2D визуализации результатов
 
 # --- Special Values ---
 INFINITY_SYMBOL = "∞"
+# Обновляем значение по умолчанию, если оно использует этот символ
+if DEFAULT_SOURCE_PARAMS["focus_point"] == "∞":
+    DEFAULT_SOURCE_PARAMS["focus_point"] = INFINITY_SYMBOL
 
-# --- Helper Functions (без изменений) ---
-def calculate_focus_point(diameter, cone_angle_deg):
-    if cone_angle_deg <= 0: return INFINITY_SYMBOL
+
+# --- Helper Functions (для SourceFrame, расчет фокуса и угла конуса) ---
+def calculate_focus_point(diameter_str, cone_angle_deg_str):
+    """
+    Рассчитывает точку фокуса L по диаметру D и углу конуса φ.
+    Возвращает строку для отображения в GUI.
+    """
     try:
-        phi_rad = math.radians(cone_angle_deg)
+        D = float(diameter_str)
+        phi_deg = float(cone_angle_deg_str)
+        if D <= 0: return "N/A (D≤0)"
+        if phi_deg <= 0 or phi_deg >= 180: return INFINITY_SYMBOL # Параллельные лучи
+        
+        phi_rad = math.radians(phi_deg)
         tan_half_phi = math.tan(phi_rad / 2.0)
-        if abs(tan_half_phi) < 1e-9: return INFINITY_SYMBOL
-        L = (diameter / 2.0) / tan_half_phi
+        if abs(tan_half_phi) < 1e-9: return INFINITY_SYMBOL # Почти параллельные
+        
+        L = (D / 2.0) / tan_half_phi
         return f"{L:.2f}"
-    except (ValueError, ZeroDivisionError): return INFINITY_SYMBOL
-
-def calculate_cone_angle(diameter, focus_point_L):
-    try:
-        L_float = float(focus_point_L)
-        if L_float <= 1e-9: return "N/A"
-        if diameter <= 0: return "N/A"
-        atan_arg = (diameter / 2.0) / L_float
-        if abs(atan_arg) > 1e9: return "N/A"
-        phi_rad = 2 * math.atan(atan_arg)
-        return f"{math.degrees(phi_rad):.2f}"
     except ValueError:
-         if focus_point_L == INFINITY_SYMBOL: return "0.00"
-         return "N/A"
-    except ZeroDivisionError:
-         return "N/A"
+        return "N/A" # Ошибка ввода
+    except ZeroDivisionError: # На всякий случай
+        return INFINITY_SYMBOL
+
+def calculate_cone_angle(diameter_str, focus_point_L_str):
+    """
+    Рассчитывает угол конуса φ по диаметру D и точке фокуса L.
+    Возвращает строку для отображения в GUI.
+    """
+    try:
+        D = float(diameter_str)
+        if D <= 0: return "N/A (D≤0)"
+
+        if focus_point_L_str == INFINITY_SYMBOL:
+            return "0.00" # Параллельные лучи соответствуют углу конуса 0
+
+        L = float(focus_point_L_str)
+        if abs(L) < 1e-9 : return "N/A (L≈0)" # Фокус в центре источника
+
+        atan_arg = (D / 2.0) / L
+        # Угол должен быть в диапазоне (0, 180) градусов. atan возвращает в (-pi/2, pi/2).
+        # Угол конуса всегда положительный.
+        half_phi_rad = math.atan(atan_arg)
+        phi_deg = math.degrees(2 * half_phi_rad)
+
+        # Корректируем угол, если фокус "за источником" (L<0)
+        # В этом случае конус как бы расходится в другую сторону, но угол остается положительным
+        # Однако, если L<0, то atan_arg<0, half_phi_rad<0, phi_deg<0.
+        # Физически угол конуса - это полный угол раствора, он всегда >0.
+        # Но для согласования с формулой фокуса, если L отрицательно, это соответствует "расходящемуся" конусу.
+        # Для GUI, вероятно, лучше всегда показывать положительный угол.
+        # Если L<0, то tan(phi/2) = (D/2)/L будет отрицательным.
+        # phi/2 = atan((D/2)/L) будет в (-pi/2, 0). phi будет в (-pi, 0).
+        # Нам нужен положительный угол, соответствующий этому расхождению.
+        # Например, если L отрицательно, это как бы конус, направленный назад.
+        # Для простоты, если L < 0, это может означать, что лучи сходятся "позади" источника.
+        # В контексте эмиссии это обычно не рассматривается, но формула позволяет.
+        # Оставим как есть, но GUI может потребовать доп. логики для интерпретации.
+        # Если L<0, то phi_deg будет отрицательным.
+        # Для GUI, вероятно, нужен положительный угол.
+        # Однако, если мы хотим, чтобы расчеты были обратимы, нужно быть осторожным.
+        # Если L отрицательный, это "виртуальный" фокус позади. Угол конуса все равно положителен.
+        # tan(phi/2) = abs( (D/2)/L ). Тогда phi/2 = atan(abs( (D/2)/L )).
+        # Но это изменит обратный расчет L.
+        # Оставим как есть: если L отрицательный, phi будет отрицательным.
+        # GUI должен это учитывать или запрещать отрицательный L.
+        # В текущей логике SourceFrame L не может быть отрицательным из-за валидации _validate_focus
+        # (хотя _validate_focus пропускает "-", но get_params преобразует в float).
+        # Если L вводится как отрицательное число, то phi_deg будет отрицательным.
+        # Это нормально для математики, но для GUI "Угол конуса" обычно ожидается положительным.
+        # Для данного симулятора, "угол конуса" - это угол, под которым лучи сходятся к фокусу L.
+        # Если L положителен, phi положителен. Если L отрицателен, phi будет отрицателен.
+        # Для простоты, будем считать, что L всегда положителен или "∞".
+        # Если L = "∞", то phi = 0.
+        # Если L очень большое, phi -> 0.
+        # Если L = D/2 / tan(макс_угол/2), то phi = макс_угол.
+        # Если L = 0, то phi = 180.
+
+        if abs(phi_deg) > 180: return "N/A (L слишком мал)" # Угол слишком большой
+        return f"{phi_deg:.2f}"
+
+    except ValueError: # L_str не float и не INFINITY_SYMBOL
+        return "N/A"
+    except ZeroDivisionError: # D/L или L=0
+        if abs(D) > 1e-9 : return "180.00" # Если диаметр есть, а фокус в центре, то угол 180
+        else: return "0.00" # Если и диаметр 0, то угол 0
+
+# Пример использования функций (можно раскомментировать для быстрой проверки)
+# if __name__ == '__main__':
+#     print(f"Фокус для D=100, phi=60: {calculate_focus_point('100', '60')}")
+#     print(f"Фокус для D=100, phi=0: {calculate_focus_point('100', '0')}")
+#     print(f"Фокус для D=100, phi=180: {calculate_focus_point('100', '180')}")
+#     print(f"Угол для D=100, L=86.60: {calculate_cone_angle('100', '86.60254')}") # Должно быть ~60
+#     print(f"Угол для D=100, L={INFINITY_SYMBOL}: {calculate_cone_angle('100', INFINITY_SYMBOL)}") # Должно быть 0
+#     print(f"Угол для D=100, L=0.01: {calculate_cone_angle('100', '0.01')}") # Должно быть близко к 180
+#     print(f"Угол для D=0, L=100: {calculate_cone_angle('0', '100')}") # Должно быть 0

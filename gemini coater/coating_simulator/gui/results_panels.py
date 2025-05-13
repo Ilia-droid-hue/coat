@@ -2,11 +2,11 @@
 # Файл: coating_simulator/gui/results_panels.py
 """
 Содержит классы для панелей, используемых в ResultsWindow.
-Версия 12.17 - Исправлено начальное отображение селектора профилей для равномерности.
+Версия 12.16 - Динамический выбор профилей для равномерности в зависимости от типа мишени.
 """
 import tkinter as tk
 from tkinter import ttk, messagebox
-import traceback 
+import traceback
 
 try:
     from .. import config
@@ -62,7 +62,10 @@ class SettingsPanel(ttk.Frame):
         self.use_logscale_var = tk.BooleanVar(value=config.VIS_DEFAULT_LOGSCALE)
         self.show_raw_profile_var = tk.BooleanVar(value=False)
 
+        # --- Параметр для выбора конфигурации профилей для равномерности ---
         self.uniformity_profile_config_var = tk.StringVar() 
+        # Значение по умолчанию будет установлено в update_profile_options
+        # --- Конец нового параметра ---
 
         self.auto_uniformity_mask_height_var = tk.StringVar(value='50.0')
         self.auto_uniformity_mode_var = tk.StringVar(value='Маска')
@@ -127,9 +130,9 @@ class SettingsPanel(ttk.Frame):
         
         # --- Виджет для выбора конфигурации профилей ---
         self.label_uniformity_profile_source = ttk.Label(profile_view_frame, text="Профили для U:")
-        self.combo_uniformity_profile_source = ttk.Combobox(profile_view_frame, textvariable=self.uniformity_profile_config_var, state='readonly', width=25) 
+        self.combo_uniformity_profile_source = ttk.Combobox(profile_view_frame, textvariable=self.uniformity_profile_config_var, state='readonly', width=25) # Ширина увеличена
         self.combo_uniformity_profile_source.bind("<<ComboboxSelected>>", self._on_settings_change)
-        # Начальное размещение виджетов, update_profile_options будет управлять их содержимым и видимостью
+        # Размещение в row=0 этого фрейма (profile_view_frame)
         self.label_uniformity_profile_source.grid(row=0, column=0, padx=(0,2), pady=pady_widget_internal, sticky=tk.W)
         self.combo_uniformity_profile_source.grid(row=0, column=1, padx=2, pady=pady_widget_internal, sticky=tk.EW)
         # --- Конец виджета ---
@@ -160,6 +163,8 @@ class SettingsPanel(ttk.Frame):
         self.entry_savgol_polyorder.bind("<KeyRelease>", self._on_settings_change_entry)
         self.entry_polyfit_degree.bind("<KeyRelease>", self._on_settings_change_entry)
         
+        # Поля сглаживания размещаются в _update_smoothing_options_display_internal
+
         chk_raw_profile = ttk.Checkbutton(profile_view_frame, text="Показать сырой профиль", variable=self.show_raw_profile_var, command=self.recalculate_callback)
         chk_raw_profile.grid(row=3, column=0, columnspan=2, pady=pady_widget_internal, sticky=tk.W)
         chk_percent = ttk.Checkbutton(profile_view_frame, text="Покрытие в %", variable=self.display_percent_var, command=self.recalculate_callback)
@@ -169,6 +174,7 @@ class SettingsPanel(ttk.Frame):
 
         auto_frame = ttk.LabelFrame(self, text="Авторавномерность", padding=internal_frame_padding)
         auto_frame.grid(row=current_main_row, column=0, sticky=tk.EW, pady=pady_label_frame); current_main_row += 1
+        # ... (остальное содержимое auto_frame)
         auto_frame.columnconfigure(1, weight=1)
         ttk.Label(auto_frame, text="Метод:").grid(row=0, column=0, padx=(0,2), pady=pady_widget_internal, sticky=tk.W)
         self.combo_auto_mode = ttk.Combobox(auto_frame, textvariable=self.auto_uniformity_mode_var, values=['Маска', 'Источник'], state='readonly', width=8)
@@ -181,6 +187,7 @@ class SettingsPanel(ttk.Frame):
 
         inverse_problem_frame = ttk.LabelFrame(self, text="Обратная задача (по профилям)", padding=internal_frame_padding)
         inverse_problem_frame.grid(row=current_main_row, column=0, sticky=tk.EW, pady=pady_label_frame); current_main_row += 1
+        # ... (остальное содержимое inverse_problem_frame)
         inverse_problem_frame.columnconfigure(0, weight=1); inverse_problem_frame.columnconfigure(1, weight=1)
         btn_load_profiles = ttk.Button(inverse_problem_frame, text="Загрузить профиль(и)", command=self.load_profiles_callback)
         btn_load_profiles.grid(row=0, column=0, columnspan=2, pady=pady_widget_internal, sticky=tk.EW)
@@ -192,8 +199,10 @@ class SettingsPanel(ttk.Frame):
         self.btn_reconstruct_map = ttk.Button(inverse_problem_frame, text="Построить карту по профилям", command=self._internal_reconstruct_map_callback)
         self.btn_reconstruct_map.grid(row=3, column=0, columnspan=2, pady=(2,0))
 
+
         control_panel = ttk.Frame(self, padding=(0, 1, 0, 0))
         control_panel.grid(row=current_main_row, column=0, sticky=tk.EW, pady=(3,0)); current_main_row += 1
+        # ... (остальное содержимое control_panel)
         control_panel.columnconfigure((0, 1), weight=1)
         btn_update = ttk.Button(control_panel, text="Обновить графики", command=self.recalculate_callback)
         btn_update.grid(row=0, column=0, padx=(0,1), pady=(1,0), sticky=tk.EW)
@@ -205,13 +214,12 @@ class SettingsPanel(ttk.Frame):
 
     def _initial_ui_update(self):
         self._update_formula_display_text_only_internal()
-        # Вызываем с config.TARGET_DISK, чтобы селектор профилей был инициализирован
-        # и показан с опциями для круглых мишеней по умолчанию.
-        # ResultsWindow затем вызовет update_profile_options с актуальным типом мишени.
-        self.update_profile_options(config.TARGET_DISK) 
-        
+        self.update_profile_options(None) # Вызываем с None, чтобы установить начальное состояние (скрыто)
+        # _update_smoothing_options_display_internal будет вызван из update_profile_options
+
     def _on_settings_change(self, event=None):
         self._update_formula_display_text_only_internal()
+        # _update_smoothing_options_display_internal() вызывается из update_profile_options, если нужно
         if self.recalculate_callback: self.recalculate_callback()
 
     def _on_settings_change_entry(self, event=None):
@@ -224,9 +232,13 @@ class SettingsPanel(ttk.Frame):
 
     def _update_smoothing_options_display_internal(self):
         method = self.smoothing_method_var.get()
-        options_start_row = 2 
+        # Параметры сглаживания теперь размещаются после "Сглаживание" (row=1)
+        # и потенциально "Ось профиля" (row=0)
+        options_start_row = 2 # Начальная строка для опций сглаживания
+
         self.savgol_frame.grid_remove()
         self.polyfit_frame.grid_remove()
+
         if method == "Savitzky-Golay":
             if self._is_scipy_available():
                 self.savgol_frame.grid(row=options_start_row, column=0, columnspan=2, sticky=tk.EW, padx=(5,0), pady=(2,0))
@@ -237,50 +249,31 @@ class SettingsPanel(ttk.Frame):
         """Обновляет опции и видимость селектора профилей для равномерности."""
         show_selector = False
         options = []
-        default_selection_key = "X" 
+        default_selection = ""
 
         if target_type == config.TARGET_LINEAR:
             show_selector = True
             options = ["X-Профиль (вдоль)", "Y-Профиль (поперек)"]
-            default_selection_key = "X"
+            default_selection = options[0]
         elif target_type in [config.TARGET_DISK, config.TARGET_DOME, config.TARGET_PLANETARY]:
             show_selector = True
             options = ["1 ось (Горизонтальная)", "2 оси (Гор.+Верт.)", "4 оси (Гор.+Верт.+Диаг.)"]
-            default_selection_key = "1H"
+            default_selection = options[0]
         
         if show_selector:
-            self.label_uniformity_profile_source.grid() # Убедимся, что метка видима
+            self.label_uniformity_profile_source.grid(row=0, column=0, padx=(0,2), pady=1, sticky=tk.W)
             self.combo_uniformity_profile_source.config(values=options)
-            
-            current_val_str = self.uniformity_profile_config_var.get()
-            # Определяем ключ для текущего значения, чтобы сравнить с ключом по умолчанию
-            current_key_is_valid_for_new_options = False
-            if "X-Профиль" in current_val_str and "X-Профиль (вдоль)" in options: current_key_is_valid_for_new_options = True
-            elif "Y-Профиль" in current_val_str and "Y-Профиль (поперек)" in options: current_key_is_valid_for_new_options = True
-            elif "1 ось" in current_val_str and "1 ось (Горизонтальная)" in options: current_key_is_valid_for_new_options = True
-            elif "2 оси" in current_val_str and "2 оси (Гор.+Верт.)" in options: current_key_is_valid_for_new_options = True
-            elif "4 оси" in current_val_str and "4 оси (Гор.+Верт.+Диаг.)" in options: current_key_is_valid_for_new_options = True
-
-            if not current_key_is_valid_for_new_options: # Если текущее значение не подходит для новых опций
-                new_default_display_value = options[0] # Берем первую опцию как значение по умолчанию
-                for opt in options: # Ищем отображаемое значение для ключа по умолчанию нового типа
-                    if (default_selection_key == "X" and "X-Профиль" in opt) or \
-                       (default_selection_key == "Y" and "Y-Профиль" in opt) or \
-                       (default_selection_key == "1H" and "1 ось" in opt) or \
-                       (default_selection_key == "2HV" and "2 оси" in opt) or \
-                       (default_selection_key == "4HVD" and "4 оси" in opt):
-                        new_default_display_value = opt
-                        break
-                self.uniformity_profile_config_var.set(new_default_display_value)
-            
-            self.combo_uniformity_profile_source.grid() # Убедимся, что комбобокс видим
+            # Устанавливаем значение по умолчанию, только если текущее значение не из списка или пустое
+            current_val = self.uniformity_profile_config_var.get()
+            if not current_val or current_val not in options:
+                 self.uniformity_profile_config_var.set(default_selection)
+            self.combo_uniformity_profile_source.grid(row=0, column=1, padx=2, pady=1, sticky=tk.EW)
         else:
             self.label_uniformity_profile_source.grid_remove()
             self.combo_uniformity_profile_source.grid_remove()
-            # Устанавливаем значение по умолчанию, даже если скрыто, для get_view_settings
-            self.uniformity_profile_config_var.set("1 ось (Горизонтальная)") 
+            self.uniformity_profile_config_var.set("1 ось (Горизонтальная)") # Скрытое значение по умолчанию
 
-        self._update_smoothing_options_display_internal()
+        self._update_smoothing_options_display_internal() # Обновляем расположение полей сглаживания
 
     def get_uniformity_method(self) -> str: return self.uniformity_method_var.get()
     def update_profile_stats(self, t_max: str, t_min: str, t_mean: str):
@@ -308,20 +301,14 @@ class SettingsPanel(ttk.Frame):
             smoothing_params_data['params'] = specific_params
         except ValueError as e: messagebox.showerror("Ошибка ввода", f"Некорректное значение в настройках сглаживания: {e}", parent=self); return None
         
+        # Преобразование выбора из комбобокса в простой ключ
         profile_config_str = self.uniformity_profile_config_var.get()
-        profile_config_key = "1H" # Default для круглых, если ничего не выбрано или скрыто
-        if self.label_uniformity_profile_source.winfo_ismapped(): # Проверяем, видим ли селектор
-            if "X-Профиль" in profile_config_str: profile_config_key = "X"
-            elif "Y-Профиль" in profile_config_str: profile_config_key = "Y"
-            # Для круглых, если выбрано:
-            elif "1 ось" in profile_config_str: profile_config_key = "1H"
-            elif "2 оси" in profile_config_str: profile_config_key = "2HV"
-            elif "4 оси" in profile_config_str: profile_config_key = "4HVD"
-        else: # Если селектор скрыт, значит это не линейная и не круглая (или ошибка), используем X по умолчанию
-            # Или, если это круглая, но селектор был скрыт из-за target_type=None при инициализации,
-            # то uniformity_profile_config_var будет "1 ось (Горизонтальная)"
-            if "1 ось" in profile_config_str: profile_config_key = "1H" # Это значение по умолчанию для скрытого
-            else: profile_config_key = "X" # Абсолютный fallback
+        profile_config_key = "1H" # Default
+        if "X-Профиль" in profile_config_str: profile_config_key = "X"
+        elif "Y-Профиль" in profile_config_str: profile_config_key = "Y"
+        elif "1 ось" in profile_config_str: profile_config_key = "1H"
+        elif "2 оси" in profile_config_str: profile_config_key = "2HV"
+        elif "4 оси" in profile_config_str: profile_config_key = "4HVD"
             
         return {
             'smoothing': smoothing_params_data,
@@ -376,7 +363,7 @@ class PlotDisplayArea(ttk.Frame): # Без изменений
     def draw_canvases(self): self.map_canvas.draw_idle(); self.profile_canvas.draw_idle()
 
 
-class InfoDisplayArea(ttk.Frame): # Без изменений
+class InfoDisplayArea(ttk.Frame): # Без изменений (оставляем 3 колонки для U, Авто, Обратная)
     def __init__(self, master, background_color, *args, **kwargs):
         super().__init__(master, padding=(0,1,0,1), style="InfoArea.TFrame", *args, **kwargs)
         self.background_color = background_color
