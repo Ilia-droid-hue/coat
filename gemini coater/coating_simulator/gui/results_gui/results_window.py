@@ -2,8 +2,7 @@
 # Файл: coating_simulator/gui/results_gui/results_window.py
 """
 Содержит класс ResultsWindow, основное окно для отображения результатов симуляции.
-Исправлена ошибка AttributeError путем контроля вызова recalculate_callback
-во время инициализации SettingsPanel.
+Гарантирует корректную передачу настроек ROI и cmap в plot_manager.
 """
 
 import tkinter as tk
@@ -30,7 +29,6 @@ from .action_callbacks import (
 try:
     from ... import config
     from ...visualization.plot import _smooth_profile as smooth_profile_data
-    from ...visualization.plot import plot_simulation_results as _
     PLOT_MODULE_AVAILABLE = True
 except ImportError as e:
     print(f"ОШИБКА ИМПОРТА в results_window.py: {e}")
@@ -59,7 +57,9 @@ class ResultsWindow(tk.Toplevel):
         self.simulation_y_coords_edges = y_coords_edges
         self.simulation_radius_grid_centers = radius_grid_centers
         self.simulation_target_params = target_params
-        self.current_vis_params = vis_params.copy()
+        # current_vis_params будет хранить все параметры визуализации,
+        # включая 'percent', 'logscale', 'cmap', и 'roi'
+        self.current_vis_params = vis_params.copy() 
         self.loaded_profiles_data = []
         self.current_target_type = self.simulation_target_params.get('target_type', config.TARGET_DISK)
 
@@ -67,7 +67,6 @@ class ResultsWindow(tk.Toplevel):
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
 
-        # 1. Создаем SettingsPanel
         self.settings_panel = SettingsPanel(
             self,
             recalculate_callback=self._recalculate_and_redraw_plots,
@@ -78,7 +77,6 @@ class ResultsWindow(tk.Toplevel):
         )
         self.settings_panel.grid(row=0, column=0, sticky=tk.NSEW, padx=(10,5), pady=(10,10))
 
-        # 2. Создаем остальные панели
         self.update_idletasks()
         try:
             s_temp = ttk.Style(); left_panel_bg_color = s_temp.lookup("TFrame", "background")
@@ -99,17 +97,14 @@ class ResultsWindow(tk.Toplevel):
         self.info_display_area = InfoDisplayArea(right_content_frame, background_color=left_panel_bg_color)
         self.info_display_area.grid(row=1, column=0, sticky=tk.NSEW, pady=(5,0))
 
-        # 3. Завершаем инициализацию SettingsPanel и делаем первый вызов update_profile_options
         if hasattr(self.settings_panel, 'update_profile_options'):
             self.settings_panel.update_profile_options(self.current_target_type)
-        if hasattr(self.settings_panel, '_initial_ui_update'): # Этот вызов может быть избыточен, если update_profile_options все делает
-            self.settings_panel._initial_ui_update() # Он вызовет update_profile_options еще раз
+        if hasattr(self.settings_panel, '_initial_ui_update'): 
+            self.settings_panel._initial_ui_update() 
 
-        # 4. Устанавливаем флаг, что ResultsWindow (и его компоненты) полностью инициализированы
         if hasattr(self.settings_panel, 'mark_initialization_complete'):
             self.settings_panel.mark_initialization_complete()
 
-        # 5. Планируем первую отрисовку
         if PLOT_MODULE_AVAILABLE:
             self.after(100, self._recalculate_and_redraw_plots)
         else:
@@ -120,32 +115,31 @@ class ResultsWindow(tk.Toplevel):
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
 
     def _recalculate_and_redraw_plots(self):
-        print("--- ResultsWindow: _recalculate_and_redraw_plots (AttributeError Fix) ---")
         if not PLOT_MODULE_AVAILABLE:
-            print("Отрисовка пропущена: PLOT_MODULE_AVAILABLE is False")
             return
 
-        # Проверяем, что все необходимые атрибуты существуют перед их использованием
         if not hasattr(self, 'settings_panel') or \
            not hasattr(self, 'plot_display_area') or \
            not hasattr(self, 'info_display_area'):
-            print("Warning: ResultsWindow не полностью инициализировано, пропуск _recalculate_and_redraw_plots.")
             return
 
         view_settings = self.settings_panel.get_view_settings()
         if view_settings is None:
-            if hasattr(self.info_display_area, 'update_uniformity_results'): # Проверка перед использованием
+            if hasattr(self.info_display_area, 'update_uniformity_results'):
                 self.info_display_area.update_uniformity_results("Ошибка в параметрах вида")
             return
 
-        self.current_vis_params['percent'] = view_settings['display_percent']
-        self.current_vis_params['logscale'] = view_settings['use_logscale']
-        smoothing_method = view_settings['smoothing']['method']
-        smoothing_params_dict = view_settings['smoothing']['params']
-        show_raw_profile_on_plot_effect = view_settings['show_raw_profile']
-        profile_config_params = view_settings.get('profile_config_params', {})
-        view_settings.setdefault('uniformity_method_key', self.settings_panel.get_uniformity_method())
+        # Обновляем self.current_vis_params всеми настройками из view_settings
+        self.current_vis_params['percent'] = view_settings.get('display_percent', config.VIS_DEFAULT_PERCENT)
+        self.current_vis_params['logscale'] = view_settings.get('use_logscale', config.VIS_DEFAULT_LOGSCALE)
+        self.current_vis_params['cmap'] = view_settings.get('cmap', {}) 
+        self.current_vis_params['roi'] = view_settings.get('roi', {'enabled': False, 'show_on_map': False}) # Убедимся, что 'roi' всегда есть
 
+        smoothing_method = view_settings.get('smoothing', {}).get('method', "Без сглаживания")
+        smoothing_params_dict = view_settings.get('smoothing', {}).get('params', {})
+        show_raw_profile_on_plot_effect = view_settings.get('show_raw_profile', False)
+        profile_config_params = view_settings.get('profile_config_params', {})
+        
         active_coverage_map = self.simulation_coverage_map_raw
         active_x_coords_edges = self.simulation_x_coords_edges
         active_y_coords_edges = self.simulation_y_coords_edges
@@ -173,14 +167,15 @@ class ResultsWindow(tk.Toplevel):
                 active_x_coords_edges, 
                 active_y_coords_edges, 
                 self.current_target_type,
-                profile_config_params
+                profile_config_params,
+                self.current_vis_params.get('roi') 
             )
 
         uniformity_result_text, first_prof_stats_dict = calculate_and_format_uniformity(
-            profiles_for_stats_raw_list, view_settings, active_coverage_map
+            profiles_for_stats_raw_list, view_settings, active_coverage_map, self.current_vis_params.get('roi')
         )
 
-        if hasattr(self.settings_panel, 'update_profile_stats'): # Проверка перед использованием
+        if hasattr(self.settings_panel, 'update_profile_stats'): 
             if first_prof_stats_dict:
                 self.settings_panel.update_profile_stats(
                     first_prof_stats_dict.get('t_max', '-'),
@@ -199,18 +194,20 @@ class ResultsWindow(tk.Toplevel):
         if display_profile_values_raw is not None and display_profile_coords_raw is not None and \
            len(display_profile_values_raw) > 0:
             base_profile_for_plot = display_profile_values_raw.copy()
-            if self.current_vis_params['percent']:
-                max_val_norm = np.nanmax(active_coverage_map.astype(float))
-                if max_val_norm is not None and max_val_norm > 0:
-                    base_profile_for_plot = base_profile_for_plot / max_val_norm * 100.0
-                else: base_profile_for_plot = np.zeros_like(base_profile_for_plot)
+            if self.current_vis_params.get('percent', True):
+                max_val_norm_overall = np.nanmax(active_coverage_map.astype(float))
+                if max_val_norm_overall is not None and max_val_norm_overall > 0:
+                    base_profile_for_plot = base_profile_for_plot / max_val_norm_overall * 100.0
+                else: 
+                    base_profile_for_plot = np.zeros_like(base_profile_for_plot)
+            
             if show_raw_profile_on_plot_effect or smoothing_method == "Без сглаживания":
                 processed_display_profile_values = base_profile_for_plot.copy()
-                if smoothing_method != "Без сглаживания":
+                if smoothing_method != "Без сглаживания": 
                     raw_comparison_profile_values = smooth_profile_data(
                         display_profile_coords_raw, base_profile_for_plot,
                         smoothing_method, smoothing_params_dict)
-                    raw_comparison_label = "Сглаженный (сравн.)"
+                    raw_comparison_label = "Сглаженный (сравн.)" 
             else: 
                 processed_display_profile_values = smooth_profile_data(
                     display_profile_coords_raw, base_profile_for_plot,
@@ -227,7 +224,8 @@ class ResultsWindow(tk.Toplevel):
             coverage_map_data=active_coverage_map,
             x_coords_edges_data=active_x_coords_edges, y_coords_edges_data=active_y_coords_edges,
             radius_grid_centers_data=active_radius_grid_centers,
-            target_params_data=active_target_params, current_vis_params_data=self.current_vis_params,
+            target_params_data=active_target_params, 
+            current_vis_params_data=self.current_vis_params, 
             display_profile_coords=display_profile_coords_raw,
             display_profile_values_processed=processed_display_profile_values,
             display_profile_axis_label=display_profile_axis_label,
@@ -240,7 +238,6 @@ class ResultsWindow(tk.Toplevel):
         
         if hasattr(self.settings_panel, 'enable_export_button'):
             self.settings_panel.enable_export_button() if active_coverage_map is not None else self.settings_panel.disable_export_button()
-        print("Обновление графиков и статистики завершено (AttributeError Fix).")
 
     def _handle_export_excel(self): placeholder_export_excel(self)
     def _handle_calculate_mask(self):
@@ -260,8 +257,7 @@ class ResultsWindow(tk.Toplevel):
 
 if __name__ == '__main__':
     root = tk.Tk()
-    root.title("Тест ResultsWindow (AttributeError Fix)")
-    # ... (остальной тестовый код без изменений) ...
+    root.title("Тест ResultsWindow (ROI Display v3)")
     num_edges_mock = config.SIM_GRID_SIZE if hasattr(config, 'SIM_GRID_SIZE') else 51
     num_cells_mock = num_edges_mock - 1
     mock_x_edges_data = np.linspace(-100, 100, num_edges_mock)
@@ -273,7 +269,9 @@ if __name__ == '__main__':
     mock_coverage_map_data = 1000 * np.exp(-(mock_radius_grid_centers_data**2 / (2 * 50**2))) + np.random.rand(num_cells_mock, num_cells_mock) * 50
     mock_target_params_linear_data = {'target_type': config.TARGET_LINEAR, 'length': 200, 'width': 160, 'particles': 100000}
     mock_target_params_disk_data = {'target_type': config.TARGET_DISK, 'diameter': 150, 'particles': 100000}
-    mock_vis_params_data = {'percent': True, 'logscale': False, 'show3d': False}
+    mock_vis_params_data = {'percent': True, 'logscale': False, 'show3d': False, 
+                            'cmap': {'manual_range': False, 'min': 0.0, 'max': 1.0},
+                            'roi': {'enabled': False, 'show_on_map': False, 'type': None, 'params': {}}} # Добавляем пустой roi по умолчанию
     def open_results_linear_test():
         try: ResultsWindow(root, mock_coverage_map_data, mock_x_edges_data, mock_y_edges_data, mock_radius_grid_centers_data, mock_target_params_linear_data, mock_vis_params_data)
         except Exception as e: print(f"Ошибка (Линейный): {e}"); traceback.print_exc()

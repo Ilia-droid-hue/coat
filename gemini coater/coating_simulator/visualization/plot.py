@@ -4,7 +4,7 @@
 Functions for plotting simulation results using Matplotlib.
 Includes profile smoothing based on provided parameters.
 Designed to draw on a provided Figure object. Uniformity stats are calculated outside.
-Version 12.18 - Added drawing of profile lines on the coverage map.
+Version 12.20 - Added drawing of ROI on the coverage map.
 """
 
 import matplotlib.pyplot as plt
@@ -62,10 +62,10 @@ def _smooth_profile(coords: np.ndarray, profile_data: np.ndarray,
                     smoothed_values = savgol_filter(profile_valid, window, poly)
                     smoothed_profile_output[valid_indices] = smoothed_values
                 else:
-                    print(f"Warning (plot.py): Not enough points ({num_valid_points}) for SavGol window ({window}). Returning raw profile.")
+                    # print(f"Warning (plot.py): Not enough points ({num_valid_points}) for SavGol window ({window}). Returning raw profile.")
                     return profile_data
             except Exception as e_sg:
-                print(f"Error during Savitzky-Golay smoothing: {e_sg}. Returning raw profile.")
+                # print(f"Error during Savitzky-Golay smoothing: {e_sg}. Returning raw profile.")
                 return profile_data
         else:
             return profile_data
@@ -76,7 +76,7 @@ def _smooth_profile(coords: np.ndarray, profile_data: np.ndarray,
         if num_valid_points <= degree:
             degree = num_valid_points - 1 if num_valid_points > 1 else 1
         if degree <= 0:
-            print(f"Warning (plot.py): Not enough points ({num_valid_points}) for polynomial degree ({degree}). Returning raw profile.")
+            # print(f"Warning (plot.py): Not enough points ({num_valid_points}) for polynomial degree ({degree}). Returning raw profile.")
             return profile_data
         try:
             coeffs = np.polyfit(coords_valid, profile_valid, degree)
@@ -85,7 +85,7 @@ def _smooth_profile(coords: np.ndarray, profile_data: np.ndarray,
             smoothed_values_poly[np.isnan(profile_data)] = np.nan
             return smoothed_values_poly
         except Exception as e_poly:
-            print(f"Error during polynomial smoothing: {e_poly}. Returning raw profile.")
+            # print(f"Error during polynomial smoothing: {e_poly}. Returning raw profile.")
             return profile_data
     else:
         return profile_data
@@ -99,9 +99,10 @@ def plot_simulation_results(fig: Figure,
                             radius_grid: np.ndarray, # Радиусы для ЦЕНТРОВ ячеек
                             target_params: dict,
                             vis_params: dict,
-                            profile_1d_coords: np.ndarray | None = None, # Для отдельного графика профиля
-                            profile_1d_values: np.ndarray | None = None, # Для отдельного графика профиля
-                            profile_lines_coords: list[list[tuple[float, float]]] | None = None, # <<< НОВЫЙ АРГУМЕНТ
+                            roi_settings: dict | None = None, # <<< НОВЫЙ АРГУМЕНТ для ROI
+                            profile_1d_coords: np.ndarray | None = None, 
+                            profile_1d_values: np.ndarray | None = None, 
+                            profile_lines_coords: list[list[tuple[float, float]]] | None = None,
                             show_colorbar: bool = True,
                             plot_type: str = "both"):
     fig.clear()
@@ -119,7 +120,7 @@ def plot_simulation_results(fig: Figure,
         if actual_profile_extent_radius > 0 and radius_grid is not None:
             if radius_grid.shape == data_on_substrate_raw.shape:
                  data_on_substrate_raw[radius_grid > actual_profile_extent_radius] = np.nan
-            else: print(f"Предупреждение (plot.py): Несовпадение форм radius_grid и data для диска/купола.")
+            # else: print(f"Предупреждение (plot.py): Несовпадение форм radius_grid и data для диска/купола.")
         elif actual_profile_extent_radius <= 0: data_on_substrate_raw[:] = np.nan
     elif target_type_for_norm == config.TARGET_LINEAR:
         length = target_params.get('length', 0.0); width = target_params.get('width', 0.0)
@@ -131,7 +132,7 @@ def plot_simulation_results(fig: Figure,
             if Y_mesh_centers.shape == data_on_substrate_raw.shape:
                 data_on_substrate_raw[np.abs(Y_mesh_centers) > (width / 2.0)] = np.nan
                 data_on_substrate_raw[np.abs(X_mesh_centers) > (length / 2.0)] = np.nan
-            else: print(f"Критическая ошибка (plot.py): Несовпадение форм Y/X_mesh_centers и data (линейн.).")
+            # else: print(f"Критическая ошибка (plot.py): Несовпадение форм Y/X_mesh_centers и data (линейн.).")
         else: data_on_substrate_raw[:] = np.nan
     elif target_type_for_norm == config.TARGET_PLANETARY:
         orbit_rad = target_params.get('orbit_diameter', 0.0) / 2.0
@@ -140,7 +141,7 @@ def plot_simulation_results(fig: Figure,
         if actual_profile_extent_radius > 0 and radius_grid is not None:
             if radius_grid.shape == data_on_substrate_raw.shape:
                 data_on_substrate_raw[radius_grid > actual_profile_extent_radius] = np.nan
-            else: print(f"Предупреждение (plot.py): Несовпадение форм radius_grid и data (планетарн.).")
+            # else: print(f"Предупреждение (plot.py): Несовпадение форм radius_grid и data (планетарн.).")
         elif actual_profile_extent_radius <= 0: data_on_substrate_raw[:] = np.nan
 
     max_val_on_substrate_raw = np.nanmax(data_on_substrate_raw) if np.any(np.isfinite(data_on_substrate_raw)) else 0.0
@@ -164,15 +165,39 @@ def plot_simulation_results(fig: Figure,
         extent = [x_min_extent, x_max_extent, y_min_extent, y_max_extent]
         aspect_ratio_val = 'equal'
         use_logscale = vis_params.get('logscale', config.VIS_DEFAULT_LOGSCALE)
+        
+        vmin_manual = vis_params.get('cmap', {}).get('min')
+        vmax_manual = vis_params.get('cmap', {}).get('max')
+        manual_cmap_range = vis_params.get('cmap', {}).get('manual_range', False)
+
+        current_vmin = np.nanmin(display_data_map) if np.any(np.isfinite(display_data_map)) else 0
+        current_vmax = np.nanmax(display_data_map) if np.any(np.isfinite(display_data_map)) else 1
+        
+        if manual_cmap_range:
+            final_vmin = vmin_manual if vmin_manual is not None else current_vmin
+            final_vmax = vmax_manual if vmax_manual is not None else current_vmax
+        else:
+            final_vmin = current_vmin
+            final_vmax = current_vmax
+
         vmin_log = None
         if use_logscale and np.any(display_data_map > 0):
-            min_positive = np.nanmin(display_data_map[display_data_map > 0])
-            vmin_log = min_positive * 0.1 if min_positive > 0 else 1e-3
-            if vmin_log is not None and np.nanmax(display_data_map) is not None and vmin_log >= np.nanmax(display_data_map):
-                vmin_log = np.nanmax(display_data_map) * 0.01
-        norm = LogNorm(vmin=vmin_log, vmax=np.nanmax(display_data_map) if np.any(np.isfinite(display_data_map)) else None) if use_logscale and vmin_log is not None and np.nanmax(display_data_map) is not None and vmin_log < np.nanmax(display_data_map) else Normalize()
+            min_positive_in_final_range = np.nanmin(display_data_map[(display_data_map > 0) & (display_data_map >= final_vmin)])
+            if np.isfinite(min_positive_in_final_range):
+                 vmin_log = min_positive_in_final_range * 0.1 if min_positive_in_final_range > 0 else 1e-3
+            else: 
+                 vmin_log = 1e-3 
+            
+            if vmin_log is not None and final_vmax is not None and vmin_log >= final_vmax :
+                vmin_log = final_vmax * 0.01 if final_vmax > 0 else 1e-3
+                if vmin_log <=0 : vmin_log = 1e-3
+
+
+        norm_to_use = Normalize(vmin=final_vmin, vmax=final_vmax)
+        if use_logscale and vmin_log is not None and final_vmax is not None and vmin_log < final_vmax and vmin_log > 0:
+            norm_to_use = LogNorm(vmin=vmin_log, vmax=final_vmax)
         
-        im = ax_map.imshow(display_data_map, extent=extent, origin='lower', cmap='hot', norm=norm, aspect=aspect_ratio_val)
+        im = ax_map.imshow(display_data_map, extent=extent, origin='lower', cmap='hot', norm=norm_to_use, aspect=aspect_ratio_val)
         
         if show_colorbar:
             cbar = fig.colorbar(im, ax=ax_map, label=coverage_label, shrink=0.7, aspect=18, pad=0.04)
@@ -193,25 +218,49 @@ def plot_simulation_results(fig: Figure,
             orbit_diameter = target_params.get('orbit_diameter', 0.0)
             if orbit_diameter > 0: ax_map.add_patch(patches.Circle((0,0), orbit_diameter/2.0, ec=outline_color, fc='none', ls=':', lw=outline_width))
 
-        # --- Отрисовка линий профилей на карте ---
         if profile_lines_coords:
             for line in profile_lines_coords:
-                if len(line) == 2: # Линия состоит из двух точек
+                if len(line) == 2: 
                     (x_start, y_start), (x_end, y_end) = line
                     ax_map.plot([x_start, x_end], [y_start, y_end],
                                 color='cyan', linestyle='--', linewidth=0.7, alpha=0.8)
-        # --- Конец отрисовки линий профилей ---
+        
+        # --- Отрисовка ROI ---
+        if roi_settings and roi_settings.get('show_on_map', False):
+            roi_type = roi_settings.get('type')
+            roi_params_values = roi_settings.get('params', {})
+            roi_color = 'lime' 
+            roi_linestyle = '-.' 
+            roi_linewidth = 1.0
+
+            if roi_type == 'circular' and roi_params_values:
+                d_min = roi_params_values.get('d_min')
+                d_max = roi_params_values.get('d_max')
+                if d_min is not None and d_min > 0:
+                    ax_map.add_patch(patches.Circle((0, 0), d_min / 2.0, 
+                                                    ec=roi_color, fc='none', 
+                                                    ls=roi_linestyle, lw=roi_linewidth)) # label убран для простоты
+                if d_max is not None and d_max > 0:
+                    ax_map.add_patch(patches.Circle((0, 0), d_max / 2.0, 
+                                                    ec=roi_color, fc='none', 
+                                                    ls=roi_linestyle, lw=roi_linewidth))
+            elif roi_type == 'rectangular' and roi_params_values:
+                width = roi_params_values.get('width')
+                height = roi_params_values.get('height')
+                offset_x = roi_params_values.get('offset_x', 0.0)
+                offset_y = roi_params_values.get('offset_y', 0.0)
+                if width is not None and height is not None and width > 0 and height > 0:
+                    rect_x = offset_x - width / 2.0
+                    rect_y = offset_y - height / 2.0
+                    ax_map.add_patch(patches.Rectangle((rect_x, rect_y), width, height,
+                                                       ec=roi_color, fc='none',
+                                                       ls=roi_linestyle, lw=roi_linewidth))
 
     if ax_profile is not None and profile_1d_coords is not None and profile_1d_values is not None:
         ax_profile.plot(profile_1d_coords, profile_1d_values, '-', color='orange', linewidth=1.2, label='Профиль')
-        profile_x_label = "Позиция X (мм)" # Метка по умолчанию
-        # Метка оси X для профиля может зависеть от того, какой профиль отображается
-        # (например, если это Y-профиль, то "Позиция Y (мм)").
-        # Эта логика должна быть выше, где определяется profile_1d_coords.
-        # Здесь мы просто используем переданную метку, если она есть в vis_params или target_params.
-        # Пока оставим как есть, но это место для улучшения.
+        profile_x_label = "Позиция X (мм)" 
         ax_profile.set_title('Профиль покрытия', fontsize=9)
-        ax_profile.set_xlabel(profile_x_label, fontsize=8) # Используем profile_x_label из аргументов, если он будет добавлен
+        ax_profile.set_xlabel(profile_x_label, fontsize=8) 
         ax_profile.set_ylabel(coverage_label, fontsize=8)
         ax_profile.grid(True, linestyle=':'); ax_profile.tick_params(axis='both', which='major', labelsize=7)
         if np.any(np.isfinite(profile_1d_values)):
